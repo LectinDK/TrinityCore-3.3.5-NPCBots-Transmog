@@ -1,3 +1,8 @@
+--
+SET @LOCALIZED_STRINGS_START = 70001;
+SET @LOCALIZED_STRINGS_END   = 70658;
+
+DELETE FROM `npc_text_locale` WHERE ID BETWEEN @LOCALIZED_STRINGS_START and @LOCALIZED_STRINGS_END AND Locale ="deDE";
 INSERT INTO `npc_text_locale` (`ID`,`Locale`,`Text0_0`) VALUES
 (70001,'deDE','Ich lebe nur, um dem Herrn zu dienen.'),
 (70002,'deDE','Du brauchst etwas?'),
