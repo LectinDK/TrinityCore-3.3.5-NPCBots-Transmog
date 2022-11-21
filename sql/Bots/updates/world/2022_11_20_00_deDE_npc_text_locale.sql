@@ -4,7 +4,7 @@ SET @LOCALIZED_STRINGS_END   = 70658;
 
 DELETE FROM `npc_text_locale` WHERE ID BETWEEN @LOCALIZED_STRINGS_START and @LOCALIZED_STRINGS_END AND Locale ="deDE";
 INSERT INTO `npc_text_locale` (`ID`,`Locale`,`Text0_0`) VALUES
-(70001,'deDE','Ich lebe nur, um dem Herrn zu dienen.'),
+(70001,'deDE','Ich lebe nur, um dem Meister zu dienen.'),
 (70002,'deDE','Du brauchst etwas?'),
 (70003,'deDE','Sterbliche... normalerweise töte ich Schurken wie dich auf Anhieb.'),
 (70004,'deDE','<Sie sehen, was ein Obsidianzerstörer sein soll. Dieser sieht jedoch anders aus, beschäfigt und verblasst, und reagiert nicht auf Ihre Anwesenheit. Sie erinnern sich, dass die Geißel irgendwann in der Vergangenheit ihre eigenen Versionen davon verwendet hat. Wie zum Teufel ist es hier gelandet? Nach weiterer Untersuchung bemerkst du eine Öffnung am Rücken der Kreatur.>'),
