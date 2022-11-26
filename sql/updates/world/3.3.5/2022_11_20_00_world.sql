@@ -10,4 +10,4 @@ INSERT INTO `smart_scripts` (`entryorguid`, `source_type`, `id`, `link`, `event_
 
 DELETE FROM `creature_addon` WHERE `guid`=85240;
 INSERT INTO `creature_addon` (`guid`, `path_id`, `mount`, `bytes1`, `bytes2`, `emote`, `auras`) VALUES
-(85240, 0, 0, 1, 1, 0, '0');
+(85240, 0, 0, 1, 1, 0, NULL);
