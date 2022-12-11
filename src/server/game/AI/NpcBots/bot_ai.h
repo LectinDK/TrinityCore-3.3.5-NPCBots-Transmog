@@ -8,6 +8,8 @@
 #include "ItemDefines.h"
 #include "Position.h"
 
+#include <tuple>
+
 /*
 NpcBot System by Trickerer (onlysuffering@gmail.com)
 */
@@ -115,7 +117,7 @@ class bot_ai : public CreatureAI
         uint8 GetBotCommandState() const { return m_botCommandState; }
         bool IsInBotParty(Unit const* unit) const;
         bool IsInBotParty(ObjectGuid guid) const;
-        bool CanBotAttack(Unit const* target, int8 byspell = 0) const;
+        bool CanBotAttack(Unit const* target, int8 byspell = 0, bool secondary = false) const;
         bool CanBotAttackOnVehicle() const;
         void ApplyBotDamageMultiplierMelee(uint32& damage, CalcDamageInfo& damageinfo) const;
         void ApplyBotDamageMultiplierMelee(int32& damage, SpellNonMeleeDamage& damageinfo, SpellInfo const* spellInfo, WeaponAttackType attackType, bool iscrit) const;
@@ -207,7 +209,7 @@ class bot_ai : public CreatureAI
 
         MeleeHitOutcome BotRollCustomMeleeOutcomeAgainst(Unit const* victim, WeaponAttackType attType) const;
 
-        float GetTotalBotStat(uint8 stat) const { return _getTotalBotStat(stat); }
+        float GetTotalBotStat(BotStatMods stat) const { return _getTotalBotStat(stat); }
 
         Item* GetEquips(uint8 slot) const { return _equips[slot]; }
         Item* GetEquipsByGuid(ObjectGuid itemGuid) const;
@@ -297,7 +299,7 @@ class bot_ai : public CreatureAI
         virtual bool BuffTarget(Unit* /*target*/, uint32 /*diff*/) { return false; }
 
         void BuffAndHealGroup(uint32 diff);
-        void RezGroup(uint32 REZZ);
+        void ResurrectGroup(uint32 REZZ);
         void CureGroup(uint32 cureSpell, uint32 diff);
         void SetStats(bool force);
         void DefaultInit();
@@ -350,10 +352,10 @@ class bot_ai : public CreatureAI
         SpellCastResult CheckBotCast(Unit const* victim, uint32 spellId) const;
         virtual bool removeShapeshiftForm() { return true; }
 
-        bool CanAffectVictim(uint32 schoolMask) const;
         bool CanRemoveReflectSpells(Unit const* target, uint32 spellId) const;
 
         bool IsMelee() const;
+        bool IsRanged() const;
 
         bool IsShootingWand(Unit const* u = nullptr) const;
 
@@ -478,6 +480,7 @@ class bot_ai : public CreatureAI
         Player* master;
         Player* _prevRRobin;
         Unit* opponent;
+        Unit* disttarget;
         Creature* botPet;
         EventProcessor Events;
         ObjectGuid aftercastTargetGuid;
@@ -555,7 +558,7 @@ class bot_ai : public CreatureAI
 
         void _castBotItemUseSpell(Item const* item, SpellCastTargets const& targets/*, uint8 cast_count = 0, uint32 glyphIndex = 0*/);
 
-        Unit* _getTarget(bool byspell, bool ranged, bool &reset) const;
+        std::tuple<Unit*, Unit*> _getTargets(bool byspell, bool ranged, bool &reset) const;
         Unit* _getVehicleTarget(BotVehicleStrats strat) const;
         void _listAuras(Player const* player, Unit const* unit) const;
         bool _checkImmunities(Unit const* target, SpellInfo const* spellInfo) const;
@@ -579,8 +582,8 @@ class bot_ai : public CreatureAI
         void _LocalizeGameObject(Player const* forPlayer, std::string &gameobjectName, uint32 entry) const;
         void _LocalizeSpell(Player const* forPlayer, std::string &spellName, uint32 entry) const;
 
-        float _getBotStat(uint8 slot, uint8 stat) const;
-        float _getTotalBotStat(uint8 stat) const;
+        float _getBotStat(uint8 slot, BotStatMods stat) const;
+        float _getTotalBotStat(BotStatMods stat) const;
         float _getRatingMultiplier(CombatRating cr) const;
 
         float _getStatScore(uint8 stat) const;
