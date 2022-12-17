@@ -688,6 +688,15 @@ bool BotMgr::HasBotClass(uint8 botclass) const
     return false;
 }
 
+bool BotMgr::HasBotWithSpec(uint8 spec, bool alive) const
+{
+    for (BotMap::const_iterator itr = _bots.cbegin(); itr != _bots.cend(); ++itr)
+        if (itr->second->GetBotAI()->GetSpec() == spec && (!alive || itr->second->IsAlive()))
+            return true;
+
+    return false;
+}
+
 bool BotMgr::HasBotPetType(uint32 petType) const
 {
     for (BotMap::const_iterator itr = _bots.begin(); itr != _bots.end(); ++itr)
@@ -973,13 +982,13 @@ void BotMgr::CleanupsBeforeBotDelete(ObjectGuid guid, uint8 removetype)
     //remove any summons
     bot->GetBotAI()->UnsummonAll();
 
-    ASSERT(bot->GetOwnerGUID() == _owner->GetGUID());
-    bot->SetOwnerGUID(ObjectGuid::Empty);
+    ASSERT(bot->GetCreatorGUID() == _owner->GetGUID());
+    //bot->SetOwnerGUID(ObjectGuid::Empty);
     //_owner->m_Controlled.erase(bot);
     bot->SetControlledByPlayer(false);
     //bot->RemoveUnitFlag(UNIT_FLAG_PVP_ATTACKABLE);
     bot->SetByteValue(UNIT_FIELD_BYTES_2, 1, 0);
-    bot->SetCreatorGUID(ObjectGuid::Empty);
+    bot->SetCreator(nullptr);
 
     Map* map = bot->FindMap();
     if (!map || map->IsDungeon())
@@ -1132,9 +1141,9 @@ BotAddResult BotMgr::AddBot(Creature* bot, bool takeMoney)
 
     _bots[bot->GetGUID()] = bot;
 
-    ASSERT(!bot->GetOwnerGUID());
-    bot->SetOwnerGUID(_owner->GetGUID());
-    bot->SetCreatorGUID(_owner->GetGUID()); //needed in case of FFAPVP
+    ASSERT(!bot->GetCreatorGUID());
+    //bot->SetOwnerGUID(_owner->GetGUID());
+    bot->SetCreator(_owner); //needed in case of FFAPVP
     //_owner->m_Controlled.insert(bot);
     bot->SetControlledByPlayer(true);
     bot->SetUnitFlag(UNIT_FLAG_PLAYER_CONTROLLED);

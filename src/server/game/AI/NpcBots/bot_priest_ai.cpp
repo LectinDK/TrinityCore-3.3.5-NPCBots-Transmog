@@ -362,6 +362,9 @@ public:
             if (GC_Timer > diff || IAmFree() || IsCasting()) return false;
             if (!IsSpellReady(PW_SHIELD_1, diff)) return false;
             if (Rand() > 65 + 100 * (me->GetMap()->IsRaid())) return false;
+            if (me->GetLevel() >= 30 && _spec != BOT_SPEC_PRIEST_DISCIPLINE &&
+                master->GetBotMgr()->HasBotWithSpec(BOT_SPEC_PRIEST_DISCIPLINE))
+                return false;
 
             Group const* gr = master->GetGroup();
             Unit* u = master;
@@ -1825,7 +1828,7 @@ public:
             Creature* myPet = me->SummonCreature(entry, *me, TEMPSUMMON_MANUAL_DESPAWN);
             //me->GetNearPoint(myPet, pos.m_positionX, pos.m_positionY, pos.m_positionZ, 0, 2, me->GetOrientation());
             //myPet->GetMotionMaster()->MovePoint(me->GetMapId(), pos);
-            myPet->SetCreatorGUID(master->GetGUID());
+            myPet->SetCreator(master);
             myPet->SetOwnerGUID(me->GetGUID());
             myPet->SetFaction(master->GetFaction());
             myPet->SetControlledByPlayer(!IAmFree());

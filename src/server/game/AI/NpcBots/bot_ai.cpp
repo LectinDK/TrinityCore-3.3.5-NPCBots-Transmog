@@ -3336,7 +3336,7 @@ bool bot_ai::IsInBotParty(Unit const* unit) const
     //Player-controlled creature case
     if (Creature const* cre = unit->ToCreature())
     {
-        ObjectGuid ownerGuid = unit->GetOwnerGUID();
+        ObjectGuid ownerGuid = unit->GetOwnerGUID() ? unit->GetOwnerGUID() : unit->GetCreatorGUID();
         if (!ownerGuid && unit->IsVehicle())
             ownerGuid = unit->GetCharmerGUID();
         //controlled by master
@@ -5878,7 +5878,8 @@ bool bot_ai::IsSpellReady(uint32 basespell, uint32 diff, bool checkGCD) const
 
     BotSpellMap::const_iterator itr = _spells.find(basespell);
     return itr == _spells.end() ? true :
-        ((itr->second->enabled == true || IAmFree()) && itr->second->spellId != 0 && itr->second->cooldown <= diff);
+        ((itr->second->enabled == true || IAmFree() || IsLastOrder(BOT_ORDER_SPELLCAST, basespell)) &&
+            itr->second->spellId != 0 && itr->second->cooldown <= diff);
 }
 //Using first-rank spell as source, sets cooldown for current spell
 void bot_ai::SetSpellCooldown(uint32 basespell, uint32 msCooldown)
@@ -8141,7 +8142,7 @@ bool bot_ai::OnGossipSelect(Player* player, Creature* creature/* == me*/, uint32
         }
         case GOSSIP_SENDER_UNEQUIP: //equips change s3: Unequip DEPRECATED
         {
-            if (!_unequip(action - GOSSIP_ACTION_INFO_DEF, player->GetGUID().GetCounter()))
+            if (!_unequip(action - GOSSIP_ACTION_INFO_DEF, player->GetGUID()))
             {} //BotWhisper("Impossible...", player);
             return OnGossipSelect(player, creature, GOSSIP_SENDER_EQUIPMENT, GOSSIP_ACTION_INFO_DEF + 1);
         }
@@ -8150,7 +8151,7 @@ bool bot_ai::OnGossipSelect(Player* player, Creature* creature/* == me*/, uint32
             bool suc = true;
             for (uint8 i = BOT_SLOT_MAINHAND; i != BOT_INVENTORY_SIZE; ++i)
             {
-                if (!(i <= BOT_SLOT_RANGED ? _resetEquipment(i, player->GetGUID().GetCounter()) : _unequip(i, player->GetGUID().GetCounter())))
+                if (!(i <= BOT_SLOT_RANGED ? _resetEquipment(i, player->GetGUID()) : _unequip(i, player->GetGUID())))
                 {
                     suc = false;
                     //std::ostringstream estr;
@@ -8221,7 +8222,7 @@ bool bot_ai::OnGossipSelect(Player* player, Creature* creature/* == me*/, uint32
                 }
             }
 
-            if (found && _equip(sender - GOSSIP_SENDER_EQUIP_AUTOEQUIP_EQUIP, item, player->GetGUID().GetCounter())){}
+            if (found && _equip(sender - GOSSIP_SENDER_EQUIP_AUTOEQUIP_EQUIP, item, player->GetGUID())){}
 
             //break; //no break: update list
         }
@@ -8414,7 +8415,7 @@ bool bot_ai::OnGossipSelect(Player* player, Creature* creature/* == me*/, uint32
         }
         case GOSSIP_SENDER_EQUIP_RESET: //equips change s4a: reset equipment
         {
-            if (_resetEquipment(action - GOSSIP_ACTION_INFO_DEF, player->GetGUID().GetCounter())){}
+            if (_resetEquipment(action - GOSSIP_ACTION_INFO_DEF, player->GetGUID())){}
             return OnGossipSelect(player, creature, GOSSIP_SENDER_EQUIPMENT, GOSSIP_ACTION_INFO_DEF + 1);
         }
         //equips change s4b: Equip item
@@ -8474,7 +8475,7 @@ bool bot_ai::OnGossipSelect(Player* player, Creature* creature/* == me*/, uint32
                 }
             }
 
-            if (found && _equip(sender - GOSSIP_SENDER_EQUIP, item, player->GetGUID().GetCounter())){}
+            if (found && _equip(sender - GOSSIP_SENDER_EQUIP, item, player->GetGUID())){}
             return OnGossipSelect(player, creature, GOSSIP_SENDER_EQUIPMENT, GOSSIP_ACTION_INFO_DEF + 1);
         }
         case GOSSIP_SENDER_ROLES_MAIN_TOGGLE: //ROLES 2: set/unset
@@ -9064,7 +9065,7 @@ bool bot_ai::OnGossipSelect(Player* player, Creature* creature/* == me*/, uint32
             bool abort = false;
             for (uint8 i = BOT_SLOT_MAINHAND; i != BOT_INVENTORY_SIZE; ++i)
             {
-                if (!(i <= BOT_SLOT_RANGED ? _resetEquipment(i, player->GetGUID().GetCounter()) : _unequip(i, player->GetGUID().GetCounter())))
+                if (!(i <= BOT_SLOT_RANGED ? _resetEquipment(i, player->GetGUID()) : _unequip(i, player->GetGUID())))
                 {
                     ChatHandler ch(player->GetSession());
                     ch.PSendSysMessage(LocalizedNpcText(player, BOT_TEXT_CANT_DISMISS_EQUIPMENT).c_str(),
@@ -11041,7 +11042,7 @@ bool bot_ai::_canEquip(Item const* newItem, uint8 slot, bool ignoreItemLevel) co
     return false;
 }
 
-bool bot_ai::_unequip(uint8 slot, ObjectGuid::LowType receiver)
+bool bot_ai::_unequip(uint8 slot, ObjectGuid receiver)
 {
     int8 id = 1;
     EquipmentInfo const* einfo = sObjectMgr->GetEquipmentInfo(me->GetEntry(), id);
@@ -11059,7 +11060,7 @@ bool bot_ai::_unequip(uint8 slot, ObjectGuid::LowType receiver)
     //hand old weapon to master
     if (slot > BOT_SLOT_RANGED || einfo->ItemEntry[slot] != itemId)
     {
-        if (receiver == master->GetGUID().GetCounter())
+        if (receiver == master->GetGUID())
         {
             ItemPosCountVec dest;
             uint32 no_space = 0;
@@ -11090,13 +11091,13 @@ bool bot_ai::_unequip(uint8 slot, ObjectGuid::LowType receiver)
         }
         else
         {
-            item->SetOwnerGUID(ObjectGuid(HighGuid::Player, receiver));
+            item->SetOwnerGUID(receiver);
 
             CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
             item->FSetState(ITEM_CHANGED);
             item->SaveToDB(trans);
             static const std::string subject = LocalizedNpcText(nullptr, BOT_TEXT_OWNERSHIP_EXPIRED);
-            MailDraft(subject, "").AddItem(item).SendMailTo(trans, MailReceiver(receiver), MailSender(me));
+            MailDraft(subject, "").AddItem(item).SendMailTo(trans, MailReceiver(receiver.GetCounter()), MailSender(me));
             CharacterDatabase.CommitTransaction(trans);
         }
     }
@@ -11129,7 +11130,7 @@ bool bot_ai::_unequip(uint8 slot, ObjectGuid::LowType receiver)
     return true;
 }
 
-bool bot_ai::_equip(uint8 slot, Item* newItem, ObjectGuid::LowType receiver)
+bool bot_ai::_equip(uint8 slot, Item* newItem, ObjectGuid receiver)
 {
     ASSERT(newItem);
 
@@ -11164,7 +11165,7 @@ bool bot_ai::_equip(uint8 slot, Item* newItem, ObjectGuid::LowType receiver)
 
     if (slot > BOT_SLOT_RANGED || einfo->ItemEntry[slot] != newItemId)
     {
-        ASSERT(receiver == master->GetGUID().GetCounter());
+        ASSERT(receiver == master->GetGUID());
 
         //cheating
         if (newItem->GetOwnerGUID() != master->GetGUID() || !master->HasItemCount(newItemId, 1))
@@ -11261,7 +11262,7 @@ void bot_ai::_updateEquips(uint8 slot, Item* item)
     BotDataMgr::UpdateNpcBotData(me->GetEntry(), NPCBOT_UPDATE_EQUIPS, _equips);
 }
 //Called from gossip menu only (applies only to weapons)
-bool bot_ai::_resetEquipment(uint8 slot, ObjectGuid::LowType receiver)
+bool bot_ai::_resetEquipment(uint8 slot, ObjectGuid receiver)
 {
     ASSERT(slot <= BOT_SLOT_RANGED);
 
@@ -12565,7 +12566,7 @@ uint32 bot_ai::GetEquipDisplayId(uint8 slot) const
     return displayId;
 }
 
-bool bot_ai::UnEquipAll(ObjectGuid::LowType receiver)
+bool bot_ai::UnEquipAll(ObjectGuid receiver)
 {
     bool suc = true;
     for (uint8 i = BOT_SLOT_MAINHAND; i != BOT_INVENTORY_SIZE; ++i)
@@ -12578,6 +12579,24 @@ bool bot_ai::UnEquipAll(ObjectGuid::LowType receiver)
     }
 
     return suc;
+}
+
+bool bot_ai::HasRealEquipment() const
+{
+    int8 id = 1;
+    EquipmentInfo const* einfo = sObjectMgr->GetEquipmentInfo(me->GetEntry(), id);
+    ASSERT(einfo, "Trying to call HasRealEquipment for bot with no equip info!");
+
+    for (uint8 i = BOT_SLOT_MAINHAND; i != BOT_INVENTORY_SIZE; ++i)
+    {
+        if (Item const* item = GetEquips(i))
+        {
+            if (i > BOT_SLOT_RANGED || einfo->ItemEntry[i] != item->GetEntry())
+                return true;
+        }
+    }
+
+    return false;
 }
 
 float bot_ai::GetAverageItemLevel() const
@@ -14373,6 +14392,28 @@ void bot_ai::_ProcessOrders()
             CancelOrder(order);
             return;
     }
+}
+bool bot_ai::IsLastOrder(BotOrderTypes order_type, uint32 param1) const
+{
+    if (!_orders.empty())
+    {
+        BotOrder const& order = _orders.front();
+        if (order_type == order._type)
+        {
+            switch (order_type)
+            {
+                case BOT_ORDER_SPELLCAST:
+                    if (order.params.spellCastParams.baseSpell == param1)
+                        return true;
+                    break;
+                default:
+                    TC_LOG_ERROR("scripts", "bot_ai:IsLastOrder: invalid order type %u!", uint32(order_type));
+                    break;
+            }
+        }
+    }
+
+    return false;
 }
 //VEHICLES
 //helpers
@@ -16176,8 +16217,8 @@ void bot_ai::OnBotEnterVehicle(Vehicle const* vehicle)
         if (seat->Flags & VEHICLE_SEAT_FLAG_CAN_CONTROL)
         {
             vehicle->GetBase()->SetFaction(master->GetFaction());
-            vehicle->GetBase()->SetOwnerGUID(master->GetGUID());
-            vehicle->GetBase()->SetCreatorGUID(master->GetGUID());
+            //vehicle->GetBase()->SetOwnerGUID(master->GetGUID());
+            vehicle->GetBase()->SetCreator(master);
             vehicle->GetBase()->SetUnitFlag(UNIT_FLAG_POSSESSED);
             vehicle->GetBase()->SetUnitFlag(UNIT_FLAG_PLAYER_CONTROLLED);
             vehicle->GetBase()->SetByteValue(UNIT_FIELD_BYTES_2, 1, master->GetByteValue(UNIT_FIELD_BYTES_2, 1));
@@ -16243,8 +16284,8 @@ void bot_ai::OnBotExitVehicle(Vehicle const* vehicle)
             vehicle->GetBase()->SetControlledByPlayer(false);
             vehicle->GetBase()->RemoveCharmedBy(me);
             vehicle->GetBase()->RestoreFaction();
-            vehicle->GetBase()->SetOwnerGUID(ObjectGuid::Empty);
-            vehicle->GetBase()->SetCreatorGUID(ObjectGuid::Empty);
+            //vehicle->GetBase()->SetOwnerGUID(ObjectGuid::Empty);
+            vehicle->GetBase()->SetCreator(nullptr);
             vehicle->GetBase()->RemoveUnitFlag(UNIT_FLAG_PLAYER_CONTROLLED);
             if (vehicle->GetBase()->GetTypeId() == TYPEID_UNIT)
                 vehicle->GetBase()->RemoveUnitFlag(UNIT_FLAG_POSSESSED);
