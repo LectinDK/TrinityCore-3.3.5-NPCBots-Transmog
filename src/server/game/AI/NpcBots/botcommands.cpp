@@ -160,6 +160,116 @@ private:
         }
     }
 
+    struct PlayerVisuals
+    {
+        struct PlayerVisualsBase{};
+        struct Skins:PlayerVisualsBase{};
+        struct Faces:PlayerVisualsBase{};
+        struct HairStyles:PlayerVisualsBase{};
+        struct HairColors:PlayerVisualsBase{};
+        struct Features:PlayerVisualsBase{};
+    };
+
+    template<typename E, Races R, Gender G>
+    static constexpr uint8 GetMaxVisual()
+    {
+        static_assert(std::is_base_of_v<PlayerVisuals::PlayerVisualsBase, E>, "GetMaxVisual() must check PlayerVisuals enums");
+
+#define MV_PRED9(skinm,skinf,facem,facef,hairm,hairf,hairc,featm,featf) \
+    if      constexpr (std::is_same_v<E, PlayerVisuals::Skins>)      return !F ? skinm : skinf; \
+    else if constexpr (std::is_same_v<E, PlayerVisuals::Faces>)      return !F ? facem : facef; \
+    else if constexpr (std::is_same_v<E, PlayerVisuals::HairStyles>) return !F ? hairm : hairf; \
+    else if constexpr (std::is_same_v<E, PlayerVisuals::HairColors>) return !F ? hairc : hairc; \
+    else if constexpr (std::is_same_v<E, PlayerVisuals::Features>)   return !F ? featm : featf
+
+        constexpr bool F = G == GENDER_FEMALE;
+        if constexpr (R == RACE_HUMAN)         { MV_PRED9(9,9, 11,14, 16,23, 9,  8,6); }
+        if constexpr (R == RACE_DWARF)         { MV_PRED9(8,8,   9,9, 15,18, 9, 10,5); }
+        if constexpr (R == RACE_NIGHTELF)      { MV_PRED9(8,8,   8,8, 11,11, 7,  5,9); }
+        if constexpr (R == RACE_GNOME)         { MV_PRED9(4,4,   6,6, 11,11, 8,  7,6); }
+        if constexpr (R == RACE_DRAENEI)       { MV_PRED9(13,13, 9,9, 13,15, 6,  7,6); }
+        if constexpr (R == RACE_ORC)           { MV_PRED9(8,8,   8,8, 11,12, 7, 10,6); }
+        if constexpr (R == RACE_UNDEAD_PLAYER) { MV_PRED9(5,5,   9,9, 14,14, 9, 16,7); }
+        if constexpr (R == RACE_TAUREN)        { MV_PRED9(18,10, 4,3, 12,11, 2,  6,4); }
+        if constexpr (R == RACE_TROLL)         { MV_PRED9(5,5,   4,5,   9,9, 9, 10,5); }
+        if constexpr (R == RACE_BLOODELF)      { MV_PRED9(9,9,   9,9, 15,18, 9, 9,10); }
+
+#undef MV_PRED9
+        return 0;
+    }
+
+    static bool IsValidVisual(uint8 race, uint8 gender, uint8 skin, uint8 face, uint8 hairs, uint8 hairc, uint8 features)
+    {
+#define VISUALS_PRED1(r) (gender == GENDER_FEMALE) ? ( \
+    skin <= GetMaxVisual<PlayerVisuals::Skins, r, GENDER_FEMALE>() && \
+    face <= GetMaxVisual<PlayerVisuals::Faces, r, GENDER_FEMALE>() && \
+    hairs <= GetMaxVisual<PlayerVisuals::HairStyles, r, GENDER_FEMALE>() && \
+    hairc <= GetMaxVisual<PlayerVisuals::HairColors, r, GENDER_FEMALE>() && \
+    features <= GetMaxVisual<PlayerVisuals::Features, r, GENDER_FEMALE>()) : ( \
+    skin <= GetMaxVisual<PlayerVisuals::Skins, r, GENDER_MALE>() && \
+    face <= GetMaxVisual<PlayerVisuals::Faces, r, GENDER_MALE>() && \
+    hairs <= GetMaxVisual<PlayerVisuals::HairStyles, r, GENDER_MALE>() && \
+    hairc <= GetMaxVisual<PlayerVisuals::HairColors, r, GENDER_MALE>() && \
+    features <= GetMaxVisual<PlayerVisuals::Features, r, GENDER_MALE>())
+
+        switch (race)
+        {
+            case RACE_HUMAN:         return VISUALS_PRED1(RACE_HUMAN);
+            case RACE_DWARF:         return VISUALS_PRED1(RACE_DWARF);
+            case RACE_NIGHTELF:      return VISUALS_PRED1(RACE_NIGHTELF);
+            case RACE_GNOME:         return VISUALS_PRED1(RACE_GNOME);
+            case RACE_DRAENEI:       return VISUALS_PRED1(RACE_DRAENEI);
+            case RACE_ORC:           return VISUALS_PRED1(RACE_ORC);
+            case RACE_UNDEAD_PLAYER: return VISUALS_PRED1(RACE_UNDEAD_PLAYER);
+            case RACE_TAUREN:        return VISUALS_PRED1(RACE_TAUREN);
+            case RACE_TROLL:         return VISUALS_PRED1(RACE_TROLL);
+            case RACE_BLOODELF:      return VISUALS_PRED1(RACE_BLOODELF);
+            default: return false;
+        }
+#undef VISUALS_PRED1
+    }
+
+    static void ReportVisualRanges(ChatHandler* handler)
+    {
+#define FILL_VISUALS_REPORT2(s,r) s \
+    << GetRaceName(r, loc) << " Male:" \
+    << " skin 0-" << uint32(GetMaxVisual<PlayerVisuals::Skins, r, GENDER_MALE>()) \
+    << " face 0-" << uint32(GetMaxVisual<PlayerVisuals::Faces, r, GENDER_MALE>()) \
+    << " hairstyle 0-" << uint32(GetMaxVisual<PlayerVisuals::HairStyles, r, GENDER_MALE>()) \
+    << " haircolor 0-" << uint32(GetMaxVisual<PlayerVisuals::HairColors, r, GENDER_MALE>()) \
+    << " features 0-" << uint32(GetMaxVisual<PlayerVisuals::Features, r, GENDER_MALE>()) \
+    << "\n" << GetRaceName(r, loc) << " Female:" \
+    << " skin 0-" << uint32(GetMaxVisual<PlayerVisuals::Skins, r, GENDER_FEMALE>()) \
+    << " face 0-" << uint32(GetMaxVisual<PlayerVisuals::Faces, r, GENDER_FEMALE>()) \
+    << " hairstyle 0-" << uint32(GetMaxVisual<PlayerVisuals::HairStyles, r, GENDER_FEMALE>()) \
+    << " haircolor 0-" << uint32(GetMaxVisual<PlayerVisuals::HairColors, r, GENDER_FEMALE>()) \
+    << " features 0-" << uint32(GetMaxVisual<PlayerVisuals::Features, r, GENDER_FEMALE>())
+
+        LocaleConstant loc = handler->GetSessionDbcLocale();
+        handler->SendSysMessage("Ranges:");
+        for (uint8 race : { RACE_HUMAN, RACE_DWARF, RACE_NIGHTELF, RACE_GNOME, RACE_DRAENEI, RACE_ORC, RACE_UNDEAD_PLAYER, RACE_TAUREN, RACE_BLOODELF })
+        {
+            std::ostringstream stream;
+            switch (race)
+            {
+                case RACE_HUMAN:         FILL_VISUALS_REPORT2(stream, RACE_HUMAN);         break;
+                case RACE_DWARF:         FILL_VISUALS_REPORT2(stream, RACE_DWARF);         break;
+                case RACE_NIGHTELF:      FILL_VISUALS_REPORT2(stream, RACE_NIGHTELF);      break;
+                case RACE_GNOME:         FILL_VISUALS_REPORT2(stream, RACE_GNOME);         break;
+                case RACE_DRAENEI:       FILL_VISUALS_REPORT2(stream, RACE_DRAENEI);       break;
+                case RACE_ORC:           FILL_VISUALS_REPORT2(stream, RACE_ORC);           break;
+                case RACE_UNDEAD_PLAYER: FILL_VISUALS_REPORT2(stream, RACE_UNDEAD_PLAYER); break;
+                case RACE_TAUREN:        FILL_VISUALS_REPORT2(stream, RACE_TAUREN);        break;
+                case RACE_TROLL:         FILL_VISUALS_REPORT2(stream, RACE_TROLL);         break;
+                case RACE_BLOODELF:      FILL_VISUALS_REPORT2(stream, RACE_BLOODELF);      break;
+                default:                                                                   break;
+            }
+
+            handler->PSendSysMessage(stream.str().c_str());
+        }
+#undef FILL_VISUALS_REPORT2
+    }
+
     struct BotInfo
     {
             explicit BotInfo(uint32 Id, std::string&& Name, uint8 Race) : id(Id), name(std::move(Name)), race(Race) {}
@@ -210,7 +320,10 @@ public:
             { "standstill", HandleNpcBotCommandStandstillCommand,   rbac::RBAC_PERM_COMMAND_NPCBOT_COMMAND_STANDSTILL, Console::No  },
             { "stopfully",  HandleNpcBotCommandStopfullyCommand,    rbac::RBAC_PERM_COMMAND_NPCBOT_COMMAND_STOPFULLY,  Console::No  },
             { "follow",     HandleNpcBotCommandFollowCommand,       rbac::RBAC_PERM_COMMAND_NPCBOT_COMMAND_FOLLOW,     Console::No  },
-            { "walk",       HandleNpcBotCommandWalkCommand,         rbac::RBAC_PERM_COMMAND_NPCBOT_COMMAND_WALK,       Console::No  },
+            { "walk",       HandleNpcBotCommandWalkCommand,         rbac::RBAC_PERM_COMMAND_NPCBOT_COMMAND_MISC,       Console::No  },
+            { "nogossip",   HandleNpcBotCommandNoGossipCommand,     rbac::RBAC_PERM_COMMAND_NPCBOT_COMMAND_MISC,       Console::No  },
+            { "unbind",     HandleNpcBotCommandUnBindCommand,       rbac::RBAC_PERM_COMMAND_NPCBOT_COMMAND_MISC,       Console::No  },
+            { "rebind",     HandleNpcBotCommandReBindCommand,       rbac::RBAC_PERM_COMMAND_NPCBOT_COMMAND_MISC,       Console::No  },
         };
 
         static ChatCommandTable npcbotAttackDistanceCommandTable =
@@ -1522,11 +1635,17 @@ public:
 
     static bool HandleNpcBotCreateNewCommand(ChatHandler* handler, Optional<std::string_view> name, Optional<uint8> bclass, Optional<uint8> race, Optional<uint8> gender, Optional<uint8> skin, Optional<uint8> face, Optional<uint8> hairstyle, Optional<uint8> haircolor, Optional<uint8> features, Optional<uint8> soundset)
     {
-        static auto const ret_err = [](ChatHandler* handler) {
-            handler->SendSysMessage(".npcbot createnew");
-            handler->SendSysMessage("Creates a new npcbot creature entry");
-            handler->SendSysMessage("Syntax: .npcbot createnew #name #class ##race ##gender ##skin ##face ##hairstyle ##haircolor ##features ##[sound_variant = {1,2,3}]");
-            handler->SendSysMessage("In case of class that cannot change appearance all extra arguments must be omitted");
+        static auto const ret_err = [](ChatHandler* handler, bool report_ranges = false) {
+            if (report_ranges)
+                ReportVisualRanges(handler);
+            else
+            {
+                handler->SendSysMessage(".npcbot createnew");
+                handler->SendSysMessage("Creates a new npcbot creature entry");
+                handler->SendSysMessage("Syntax: .npcbot createnew #name #class ##race ##gender ##skin ##face ##hairstyle ##haircolor ##features ##[sound_variant = {1,2,3}]");
+                handler->SendSysMessage("In case of class that cannot change appearance all extra arguments must be omitted");
+                handler->SendSysMessage("Use '.npcbot createnew ranges' to print visuals constraints for all races");
+            }
             handler->SetSentErrorMessage(true);
             return false;
         };
@@ -1542,7 +1661,7 @@ public:
         };
 
         if (!bclass || !name)
-            return ret_err(handler);
+            return ret_err(handler, name && *name == "ranges");
 
         bool const can_change_appearance = (*bclass < BOT_CLASS_EX_START || *bclass == BOT_CLASS_ARCHMAGE);
 
@@ -1573,59 +1692,8 @@ public:
             (*bclass == BOT_CLASS_ARCHMAGE && *race != RACE_HUMAN))
             return ret_err_invalid_args_for(handler, "class", GetClassName(*bclass, handler->GetSessionDbcLocale()));
 
-#define GENDER_PRED2(male,female) ((male == female || *gender == GENDER_MALE) ? male : female)
-        if (can_change_appearance)
-        {
-            static const auto ret_race_err = [](ChatHandler* handler, uint8 race) {
-                return ret_err_invalid_args_for(handler, "race", GetRaceName(race, handler->GetSessionDbcLocale()));
-            };
-            switch (*race)
-            {
-                case RACE_HUMAN:
-                    if (*skin > 9 || *face > GENDER_PRED2(11, 14) || *hairstyle > GENDER_PRED2(16, 23) || *haircolor > 9 || *features > GENDER_PRED2(8, 6))
-                        return ret_race_err(handler, *race);
-                    break;
-                case RACE_DWARF:
-                    if (*skin > 8 || *face > GENDER_PRED2(9,9) || *hairstyle > GENDER_PRED2(15,18) || *haircolor > 9 || *features > GENDER_PRED2(10,5))
-                        return ret_race_err(handler, *race);
-                    break;
-                case RACE_NIGHTELF:
-                    if (*skin > 8 || *face > GENDER_PRED2(8,8) || *hairstyle > GENDER_PRED2(11,11) || *haircolor > 7 || *features > GENDER_PRED2(5,9))
-                        return ret_race_err(handler, *race);
-                    break;
-                case RACE_GNOME:
-                    if (*skin > 4 || *face > GENDER_PRED2(6,6) || *hairstyle > GENDER_PRED2(11,11) || *haircolor > 8 || *features > GENDER_PRED2(7,6))
-                        return ret_race_err(handler, *race);
-                    break;
-                case RACE_DRAENEI:
-                    if (*skin > 13 || *face > GENDER_PRED2(9,9) || *hairstyle > GENDER_PRED2(13,15) || *haircolor > 6 || *features > GENDER_PRED2(7,6))
-                        return ret_race_err(handler, *race);
-                    break;
-                case RACE_ORC:
-                    if (*skin > 8 || *face > GENDER_PRED2(8,8) || *hairstyle > GENDER_PRED2(11,12) || *haircolor > 7 || *features > GENDER_PRED2(10,6))
-                        return ret_race_err(handler, *race);
-                    break;
-                case RACE_UNDEAD_PLAYER:
-                    if (*skin > 5 || *face > GENDER_PRED2(9,9) || *hairstyle > GENDER_PRED2(14,14) || *haircolor > 9 || *features > GENDER_PRED2(16,7))
-                        return ret_race_err(handler, *race);
-                    break;
-                case RACE_TAUREN:
-                    if (*skin > GENDER_PRED2(18,10) || *face > GENDER_PRED2(4,3) || *hairstyle > GENDER_PRED2(12,11) || *haircolor > 2 || *features > GENDER_PRED2(6,4))
-                        return ret_race_err(handler, *race);
-                    break;
-                case RACE_TROLL:
-                    if (*skin > 5 || *face > GENDER_PRED2(4,5) || *hairstyle > GENDER_PRED2(9,9) || *haircolor > 9 || *features > GENDER_PRED2(10,5))
-                        return ret_race_err(handler, *race);
-                    break;
-                case RACE_BLOODELF:
-                    if (*skin > 9 || *face > GENDER_PRED2(9,9) || *hairstyle > GENDER_PRED2(15,18) || *haircolor > 9 || *features > GENDER_PRED2(9,10))
-                        return ret_race_err(handler, *race);
-                    break;
-                default:
-                    return ret_err_invalid_arg(handler, "race", race);
-            }
-        }
-#undef GENDER_PRED2
+        if (can_change_appearance && !IsValidVisual(*race, *gender, *skin, *face, *hairstyle, *haircolor, *features))
+            return ret_err_invalid_args_for(handler, "race", GetRaceName(*race, handler->GetSessionDbcLocale()));
 
         //here we force races for custom classes
         switch (*bclass)
@@ -1893,13 +1961,19 @@ public:
             return false;
         }
 
+        std::vector<ObjectGuid> guidvec;
+        BotDataMgr::GetNPCBotGuidsByOwner(guidvec, master->GetGUID());
+        BotMap const* map = master->GetBotMgr()->GetBotMap();
+        guidvec.erase(std::remove_if(std::begin(guidvec), std::end(guidvec),
+            [bmap = map](ObjectGuid guid) { return bmap->find(guid) != bmap->end(); }
+        ), std::end(guidvec));
+
         handler->PSendSysMessage("Listing NpcBots for %s", master->GetName().c_str());
-        handler->PSendSysMessage("Owned NpcBots: %u", master->GetNpcBotsCount());
+        handler->PSendSysMessage("Owned NpcBots: %u (active: %u)", uint32(guidvec.size() + map->size()), uint32(map->size()));
         for (uint8 i = BOT_CLASS_WARRIOR; i != BOT_CLASS_END; ++i)
         {
             uint8 count = 0;
             uint8 alivecount = 0;
-            BotMap const* map = master->GetBotMgr()->GetBotMap();
             for (BotMap::const_iterator itr = map->begin(); itr != map->end(); ++itr)
             {
                 if (Creature* cre = itr->second)
@@ -1940,6 +2014,19 @@ public:
             }
             handler->PSendSysMessage("%s: %u (alive: %u)", bclass, count, alivecount);
         }
+
+        if (guidvec.empty())
+            return true;
+
+        handler->PSendSysMessage("%u unbound bots:", uint32(guidvec.size()));
+        for (ObjectGuid guid : guidvec)
+        {
+            Creature const* bot = BotDataMgr::FindBot(guid.GetEntry());
+            std::string ccolor, cname;
+            GetBotClassNameAndColor(bot ? bot->GetBotClass() : uint8(BOT_CLASS_NONE), ccolor, cname);
+            handler->PSendSysMessage("%s (%s)", bot ? bot->GetName().c_str() : "Unknown", "|c" + ccolor + cname + "|r");
+        }
+
         return true;
     }
 
@@ -2056,6 +2143,94 @@ public:
         }
 
         handler->SendSysMessage(msg.c_str());
+        return true;
+    }
+
+    static bool HandleNpcBotCommandNoGossipCommand(ChatHandler* handler)
+    {
+        Player* owner = handler->GetSession()->GetPlayer();
+
+        if (!owner->HaveBot())
+        {
+            handler->SendSysMessage(".npcbot command nogossip");
+            handler->SendSysMessage("Toggles gossip availability for your npcbots");
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+
+        std::string msg;
+        bool isNoGossipEnabled = owner->GetBotMgr()->GetBotMap()->begin()->second->GetBotAI()->HasBotCommandState(BOT_COMMAND_NOGOSSIP);
+        if (!isNoGossipEnabled)
+        {
+            owner->GetBotMgr()->SendBotCommandState(BOT_COMMAND_NOGOSSIP);
+            msg = "Bots' gossip is DISABLED";
+        }
+        else
+        {
+            owner->GetBotMgr()->SendBotCommandStateRemove(BOT_COMMAND_NOGOSSIP);
+            msg = "Bots' gossip is ENABLED";
+        }
+
+        handler->SendSysMessage(msg.c_str());
+        return true;
+    }
+
+    static bool HandleNpcBotCommandReBindCommand(ChatHandler* handler, Optional<std::string_view> botname)
+    {
+        Player const* owner = handler->GetSession()->GetPlayer();
+        Unit const* u = owner->GetSelectedUnit();
+        if (!owner->HaveBot() || (!u && !botname))
+        {
+            handler->SendSysMessage(".npcbot command rebind [#name]");
+            handler->SendSysMessage("Re-binds selected/named unbound npcbot");
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+
+        Creature const* cre = (u && u->GetTypeId() == TYPEID_UNIT) ? u->ToCreature() : BotDataMgr::FindBot(*botname, owner->GetSession()->GetSessionDbLocaleIndex());
+        if (!cre || !cre->IsNPCBot() || owner->GetBotMgr()->GetBot(cre->GetGUID()) ||
+            !cre->GetBotAI()->HasBotCommandState(BOT_COMMAND_UNBIND) ||
+            BotDataMgr::SelectNpcBotData(cre->GetEntry())->owner != owner->GetGUID().GetCounter())
+        {
+            handler->SendSysMessage("Must target your unbound npcbot");
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+
+        if (owner->GetBotMgr()->RebindBot(const_cast<Creature*>(cre)) != BOT_ADD_SUCCESS)
+        {
+            handler->SendSysMessage("Failed to re-bind bot for some reason!");
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+
+        handler->PSendSysMessage("%s successfully re-bound", cre->GetName().c_str());
+        return true;
+    }
+
+    static bool HandleNpcBotCommandUnBindCommand(ChatHandler* handler, Optional<std::string_view> botname)
+    {
+        Player const* owner = handler->GetSession()->GetPlayer();
+        Unit const* u = owner->GetSelectedUnit();
+        if (!owner->HaveBot() || (!u && !botname))
+        {
+            handler->SendSysMessage(".npcbot command unbind [#name]");
+            handler->SendSysMessage("Frees selected/named npcbot temporarily. The bot will return to home location and wait until re-bound");
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+
+        Creature const* cre = (u && u->GetTypeId() == TYPEID_UNIT) ? u->ToCreature() : owner->GetBotMgr()->GetBotByName(*botname);
+        if (!cre || !cre->IsNPCBot() || !owner->GetBotMgr()->GetBot(cre->GetGUID()) ||
+            cre->GetBotAI()->HasBotCommandState(BOT_COMMAND_UNBIND))
+        {
+            handler->SendSysMessage("Must target your active npcbot");
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+
+        owner->GetBotMgr()->UnbindBot(cre->GetGUID());
+        handler->PSendSysMessage("%s successfully unbound", cre->GetName().c_str());
         return true;
     }
 
@@ -2186,7 +2361,7 @@ public:
         if (!mgr)
             mgr = new BotMgr(owner);
 
-        if (mgr->AddBot(bot, false) == BOT_ADD_SUCCESS)
+        if (mgr->AddBot(bot) == BOT_ADD_SUCCESS)
         {
             handler->PSendSysMessage("%s is now your npcbot", bot->GetName().c_str());
             return true;

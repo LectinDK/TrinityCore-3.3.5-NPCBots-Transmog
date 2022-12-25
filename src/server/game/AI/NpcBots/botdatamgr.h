@@ -144,10 +144,12 @@ class BotDataMgr
         static void RegisterBot(Creature const* bot);
         static void UnregisterBot(Creature const* bot);
         static Creature const* FindBot(uint32 entry);
+        static Creature const* FindBot(std::string_view name, LocaleConstant loc);
         static NpcBotRegistry const& GetExistingNPCBots();
         static void GetNPCBotGuidsByOwner(std::vector<ObjectGuid> &guids_vec, ObjectGuid owner_guid);
         static ObjectGuid GetNPCBotGuid(uint32 entry);
         static std::vector<uint32> GetExistingNPCBotIds();
+        static uint8 GetOwnedBotsCount(ObjectGuid owner_guid, uint32 class_mask = 0);
 
         static std::shared_mutex* GetLock();
 

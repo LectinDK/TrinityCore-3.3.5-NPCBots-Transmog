@@ -34,7 +34,7 @@
 #include "World.h"
 /*
 NpcBot System by Trickerer (https://github.com/trickerer/Trinity-Bots; onlysuffering@gmail.com)
-Version 4.15.22a
+Version 5.2.77a
 Original idea: https://bitbucket.org/lordpsyan/trinitycore-patches/src/3b8b9072280e/Individual/11185-BOTS-NPCBots.patch
 TODO:
 dk pets (garg, aod, rdw)
@@ -153,7 +153,6 @@ bot_ai::bot_ai(Creature* creature) : CreatureAI(creature)
     for (uint8 i = BOT_SLOT_MAINHAND; i != BOT_INVENTORY_SIZE; ++i)
         _equips[i] = nullptr;
 
-    _reviveTimer = 0;
     _powersTimer = 0;
     _chaseTimer = 0;
     _engageTimer = 0;
@@ -381,34 +380,9 @@ bool bot_ai::SetBotOwner(Player* newowner)
     if (!mgr)
         mgr = new BotMgr(newowner);
 
-    bool takeMoney = (_ownerGuid != newowner->GetGUID().GetCounter());
-    if (mgr->AddBot(me, takeMoney) & BOT_ADD_FATAL)
+    if (mgr->AddBot(me) & BOT_ADD_FATAL)
     {
-        //TC_LOG_ERROR("entities.player", "bot_ai::SetBotOwner(): player %s (%s) can't add bot %s (FATAL), removing...",
-        //    master->GetName().c_str(), master->GetGUID().ToString().c_str(), me->GetName().c_str());
-        //failed to add bot
-        //if (_ownerGuid)
-        //{
-        //    CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_UPD_NPCBOT_OWNER);
-        //    //"UPDATE characters_npcbot SET owner = ? WHERE entry = ?", CONNECTION_ASYNC
-        //    stmt->setUInt32(0, uint32(0));
-        //    stmt->setUInt32(1, me->GetEntry());
-        //    CharacterDatabase.Execute(stmt);
-        //}
-
-        if (_ownerGuid)
-        {
-            TC_LOG_ERROR("entities.player", "bot_ai::SetBotOwner(): %s's master %s (%s) is found but bot failed to set owner (fatal)! Unbinding bot temporarily (until server restart)...",
-                me->GetName().c_str(), newowner->GetName().c_str(), newowner->GetGUID().ToString().c_str());
-            //_ownerGuid = 0;
-
-            SetBotCommandState(BOT_COMMAND_FULLSTOP); //prevent all actions
-            me->SetStandState(UNIT_STAND_STATE_SLEEP);
-            return false;
-        }
-
-        checkMasterTimer = 30000;
-        ResetBotAI(BOTAI_RESET_LOST);
+        checkMasterTimer += 30000;
         return false;
     }
 
@@ -532,8 +506,9 @@ void bot_ai::ResetBotAI(uint8 resetType)
 {
     //ASSERT(me->IsInWorld());
 
-    m_botCommandState = BOT_COMMAND_FOLLOW;
+    _botCommandState = BOT_COMMAND_FOLLOW;
     _botAwaitState = BOT_AWAIT_NONE;
+    _reviveTimer = 0;
 
     master = reinterpret_cast<Player*>(me);
     if (resetType & BOTAI_RESET_MASK_ABANDON_MASTER)
@@ -1099,13 +1074,13 @@ void bot_ai::AbortAwaitStateRemoval()
     }
 }
 
-void bot_ai::SetBotCommandState(uint8 st, bool force, Position* newpos)
+void bot_ai::SetBotCommandState(uint32 st, bool force, Position* newpos)
 {
-    if (!me->IsAlive())
-        return;
-
-    if (JumpingOrFalling())
-        return;
+    if (st != BOT_COMMAND_UNBIND)
+    {
+        if (!me->IsAlive() || JumpingOrFalling())
+            return;
+    }
 
     Vehicle* veh = me->GetVehicle();
     VehicleSeatEntry const* seat = veh ? veh->GetSeatForPassenger(me) : nullptr;
@@ -1165,12 +1140,12 @@ void bot_ai::SetBotCommandState(uint8 st, bool force, Position* newpos)
         }
     }
 
-    m_botCommandState |= st;
+    _botCommandState |= st;
 }
 
-void bot_ai::RemoveBotCommandState(uint8 st)
+void bot_ai::RemoveBotCommandState(uint32 st)
 {
-    m_botCommandState &= ~st;
+    _botCommandState &= ~st;
 }
 
 bool bot_ai::IsPointedTarget(Unit const* target, uint8 targetFlags) const
@@ -1254,8 +1229,9 @@ void bot_ai::BuffAndHealGroup(uint32 diff)
             std::list<Unit*> targets2;
             GetNearbyFriendlyTargetsList(targets2, 30);
             targets2.remove_if(BOTAI_PRED::BuffTargetExclude());
+            targets2.remove_if([](Unit const* unit) { return unit->GetTypeId() != TYPEID_PLAYER; });
             for (std::list<Unit*>::const_iterator itr = targets2.begin(); itr != targets2.end(); ++itr)
-                if (urand(1,100) <= 30 && BuffTarget(*itr, diff))
+                if (urand(1, 100) <= 30 && BuffTarget(*itr, diff))
                     return;
         }
 
@@ -1668,7 +1644,7 @@ void bot_ai::CureGroup(uint32 cureSpell, uint32 diff)
             std::list<Unit*> targets1;
             GetNearbyFriendlyTargetsList(targets1, 38);
             for (std::list<Unit*>::const_iterator itr = targets1.begin(); itr != targets1.end(); ++itr)
-                if (_canCureTarget(*itr, cureSpell))
+                if (((*itr)->IsPlayer() || (*itr)->ToPet()) && _canCureTarget(*itr, cureSpell))
                     cureTargets.push_back(*itr);
         }
 
@@ -6547,7 +6523,7 @@ bool bot_ai::Wait()
         return true;
 
     if (IAmFree())
-        waitTimer = me->IsInCombat() ? 500 : urand(750, 1250);
+        waitTimer = me->IsInCombat() ? 500 : ((__rand + 100) * 50);
     else if (!master->GetMap()->IsRaid())
         waitTimer = std::min<uint32>(uint32(50 * (master->GetNpcBotsCount() - 1) + __rand), 500);
     else
@@ -6666,7 +6642,7 @@ bool bot_ai::OnGossipHello(Player* player, uint32 /*option*/)
 {
     if (!BotMgr::IsNpcBotModEnabled() || !BotMgr::IsClassEnabled(_botclass) ||
         IsTempBot() || me->IsInCombat() || CCed(me) || IsCasting() || IsDuringTeleport() ||
-        HasBotCommandState(BOT_COMMAND_ISSUED_ORDER) ||
+        HasBotCommandState(BOT_COMMAND_ISSUED_ORDER | BOT_COMMAND_NOGOSSIP) ||
         (me->GetVehicle() && me->GetVehicle()->GetBase()->IsInCombat()))
     {
         player->PlayerTalkClass->SendCloseGossip();
@@ -6723,22 +6699,12 @@ bool bot_ai::OnGossipHello(Player* player, uint32 /*option*/)
                 reason = -1;
             if (!reason && _ownerGuid)
                 reason = 1;
-            if (!reason && player->GetNpcBotsCount() >= BotMgr::GetMaxNpcBots())
+            if (!reason && BotDataMgr::GetOwnedBotsCount(player->GetGUID()) >= BotMgr::GetMaxNpcBots())
                 reason = 2;
             if (!reason && !player->HasEnoughMoney(cost))
                 reason = 3;
-
-            if (!reason && BotMgr::GetMaxClassBots() && player->HaveBot())
-            {
-                uint8 count = 0;
-                BotMap const* map = player->GetBotMgr()->GetBotMap();
-                for (BotMap::const_iterator itr = map->begin(); itr != map->end(); ++itr)
-                    if (itr->second->GetBotClass() == _botclass)
-                        ++count;
-
-                if (!reason && count >= BotMgr::GetMaxClassBots())
-                    reason = 4;
-            }
+            if (!reason && BotMgr::GetMaxClassBots() && BotDataMgr::GetOwnedBotsCount(player->GetGUID(), me->GetClassMask()) >= BotMgr::GetMaxClassBots())
+                reason = 4;
 
             std::ostringstream message1;
             std::ostringstream message2;
@@ -6790,7 +6756,8 @@ bool bot_ai::OnGossipHello(Player* player, uint32 /*option*/)
             AddGossipItemFor(player, GOSSIP_ICON_TALK, LocalizedNpcText(player, BOT_TEXT_MANAGE_ABILITIES), GOSSIP_SENDER_ABILITIES, GOSSIP_ACTION_INFO_DEF + 1);
             if (_botclass < BOT_CLASS_EX_START)
             {
-                AddGossipItemFor(player, GOSSIP_ICON_TALK, LocalizedNpcText(player, BOT_TEXT_MANAGE_TALENTS), GOSSIP_SENDER_SPEC, GOSSIP_ACTION_INFO_DEF + 1);
+                if (me->GetLevel() >= 10)
+                    AddGossipItemFor(player, GOSSIP_ICON_TALK, LocalizedNpcText(player, BOT_TEXT_MANAGE_TALENTS), GOSSIP_SENDER_SPEC, GOSSIP_ACTION_INFO_DEF + 1);
                 AddGossipItemFor(player, GOSSIP_ICON_TALK, LocalizedNpcText(player, BOT_TEXT_GIVE_CONSUMABLE), GOSSIP_SENDER_USEITEM, GOSSIP_ACTION_INFO_DEF + 1);
             }
 
@@ -7702,7 +7669,7 @@ bool bot_ai::OnGossipSelect(Player* player, Creature* creature/* == me*/, uint32
                 AddGossipItemFor(player, GOSSIP_ICON_TALK, LocalizedNpcText(player, BOT_TEXT_SLOT_NECK) + "...", GOSSIP_SENDER_EQUIPMENT_SHOW, GOSSIP_ACTION_INFO_DEF + uint32(BOT_SLOT_NECK));
             }
 
-            AddGossipItemFor(player, GOSSIP_ICON_CHAT, LocalizedNpcText(player, BOT_TEXT_UNEQUIP_ALL), GOSSIP_SENDER_UNEQUIP_ALL, GOSSIP_ACTION_INFO_DEF + 1);
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT, LocalizedNpcText(player, BOT_TEXT_UNEQUIP_ALL), GOSSIP_SENDER_UNEQUIP_ALL, GOSSIP_ACTION_INFO_DEF + 1, LocalizedNpcText(player, BOT_TEXT_UNEQUIP_ALL) + "?", 0, false);
             if (creature->GetCreatureTemplate()->unit_flags2 & UNIT_FLAG2_MIRROR_IMAGE)
                 AddGossipItemFor(player, GOSSIP_ICON_CHAT, LocalizedNpcText(player, BOT_TEXT_UPDATE_VISUAL), GOSSIP_SENDER_MODEL_UPDATE, GOSSIP_ACTION_INFO_DEF + 1);
             AddGossipItemFor(player, GOSSIP_ICON_CHAT, LocalizedNpcText(player, BOT_TEXT_BACK), 1, GOSSIP_ACTION_INFO_DEF + 1);
@@ -12860,7 +12827,7 @@ void bot_ai::ApplyRacials()
                 InitSpellMap(RaceSpellForClass(myrace, _botclass), true, false);
             break;
         case RACE_DRAENEI:
-            RefreshAura(6562); //Heroic Presence (28878 is not present)
+            RefreshAura(6562, uint8(!IAmFree())); //Heroic Presence (28878 is not present)
             RefreshAura(20579); //Shadow Resistance (universal since creatures do not lose cast time on damage anyways)
             if (firstspawn)
                 InitSpellMap(RaceSpellForClass(myrace, _botclass), true, false);
@@ -13430,6 +13397,8 @@ void bot_ai::FindMaster()
     if (!IAmFree())
         return;
     if (IsDuringTeleport())
+        return;
+    if (HasBotCommandState(BOT_COMMAND_UNBIND))
         return;
 
     if (Player* player = ObjectAccessor::FindPlayerByLowGUID(_ownerGuid))
@@ -15314,7 +15283,7 @@ uint8 bot_ai::LivingVehiclesCount(uint32 entry) const
 //opponent unsafe
 bool bot_ai::GlobalUpdate(uint32 diff)
 {
-    if (BotDataMgr::AllBotsLoaded() == false)
+    if (!BotMgr::IsNpcBotModEnabled() || !BotDataMgr::AllBotsLoaded())
         return false;
 
     //db saves with cd
@@ -15373,6 +15342,9 @@ bool bot_ai::GlobalUpdate(uint32 diff)
             //walk mode check
             if (HasBotCommandState(BOT_COMMAND_WALK) != me->IsWalking())
                 me->SetWalk(!me->IsWalking());
+            //gossip availability check
+            if (HasBotCommandState(BOT_COMMAND_NOGOSSIP) && me->HasNpcFlag(UNIT_NPC_FLAG_GOSSIP))
+                me->RemoveNpcFlag(UNIT_NPC_FLAG_GOSSIP);
         }
     }
 
@@ -15784,7 +15756,7 @@ bool bot_ai::GlobalUpdate(uint32 diff)
     //update flags
     if (!me->IsInCombat() && !_evadeMode && _atHome)
     {
-        if (!me->HasNpcFlag(UNIT_NPC_FLAG_GOSSIP))
+        if (!me->HasNpcFlag(UNIT_NPC_FLAG_GOSSIP) && !HasBotCommandState(BOT_COMMAND_NOGOSSIP))
             me->SetNpcFlag(UNIT_NPC_FLAG_GOSSIP);
         if (me->HasUnitFlag(UNIT_FLAG_PET_IN_COMBAT))
             me->RemoveUnitFlag(UNIT_FLAG_PET_IN_COMBAT);
