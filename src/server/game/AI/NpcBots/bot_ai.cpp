@@ -4548,6 +4548,29 @@ void bot_ai::CalculateAoeSpots(Unit const* unit, AoeSpotsVec& spots)
             spots.push_back(AoeSpotsVec::value_type(*(*ci), radius));
         }
     }
+
+    //STUB
+    //if (!unit->IsPlayer() || !unit->ToPlayer()->HaveBot())
+    //    return;
+
+    //switch (unit->GetMapId())
+    //{
+    //    case 409: //Molten Core
+    //        break;
+    //    default:
+    //        return;
+    //}
+
+    //BotMap const* bmap = unit->ToPlayer()->GetBotMgr()->GetBotMap();
+    //for (BotMap::const_iterator itr = bmap->begin(); itr != bmap->end(); ++itr)
+    //{
+    //    if (itr->second && itr->second->IsInWorld() && itr->second->IsAlive())
+    //    {
+    //        // Living Bomb
+    //        if (unit->GetMapId() == 409 && !!itr->second->GetAuraEffect(SPELL_AURA_PERIODIC_TRIGGER_SPELL, SPELLFAMILY_GENERIC, 1646, 0))
+    //            spots.push_back(AoeSpotsVec::value_type(itr->second->GetPosition(), 18.0));
+    //    }
+    //}
 }
 
 void bot_ai::CalculateAoeSafeSpots(Unit* target, float maxdist, AoeSafeSpotsVec& safespots) const
@@ -5050,7 +5073,7 @@ void bot_ai::_updateMountedState()
 
     bool aura = me->HasAuraType(SPELL_AURA_MOUNTED);
     bool mounted = me->IsMounted() && (_botclass != BOT_CLASS_ARCHMAGE || aura);
-    bool template_fly = me->GetCreatureTemplate()->Movement.Flight == CreatureFlightMovementType::CanFly;
+    bool template_fly = me->GetCreatureTemplate()->Movement.Flight != CreatureFlightMovementType::None;
 
     //allow dismount
     if (!CanMount() && !aura && !mounted)
@@ -5060,11 +5083,10 @@ void bot_ai::_updateMountedState()
     {
         const_cast<CreatureTemplate*>(me->GetCreatureTemplate())->Movement.Flight = CreatureFlightMovementType::None;
         me->SetCanFly(false);
+        me->m_movementInfo.RemoveMovementFlag(MOVEMENTFLAG_HOVER | MOVEMENTFLAG_CAN_FLY);
         me->SetDisableGravity(false);
-        me->m_movementInfo.RemoveMovementFlag(MOVEMENTFLAG_FLYING);
         me->RemoveAurasByType(SPELL_AURA_MOUNTED);
         me->Dismount();
-        me->RemoveUnitMovementFlag(MOVEMENTFLAG_FALLING|MOVEMENTFLAG_FALLING_FAR|MOVEMENTFLAG_PITCH_UP|MOVEMENTFLAG_PITCH_DOWN|MOVEMENTFLAG_SPLINE_ELEVATION|MOVEMENTFLAG_FALLING_SLOW);
         me->BotStopMovement();
         return;
     }
@@ -5605,6 +5627,7 @@ void bot_ai::CheckUsableItems(uint32 diff)
                         castTarget = me->GetNextRandomRaidMemberOrPet(10.f);
                         if (!castTarget)
                             castTarget = me;
+                        break;
                     case BOT_ITEM_USE_SPELL_TARGET_NONE:
                     default:
                         break;
@@ -6653,7 +6676,7 @@ void bot_ai::OnSpellHit(Unit* caster, SpellInfo const* spell)
                 master->HasAuraType(SPELL_AURA_MOD_INCREASE_MOUNTED_FLIGHT_SPEED))
             {
                 //TC_LOG_ERROR("entities.unit", "OnSpellHit: modding flight speed");
-                const_cast<CreatureTemplate*>(me->GetCreatureTemplate())->Movement.Flight = CreatureFlightMovementType::CanFly;
+                const_cast<CreatureTemplate*>(me->GetCreatureTemplate())->Movement.Flight = CreatureFlightMovementType::DisableGravity;
                 me->SetCanFly(true);
                 me->SetDisableGravity(true);
                 if (Aura* mount = me->GetAura(spell->Id))
@@ -6673,7 +6696,6 @@ void bot_ai::OnSpellHit(Unit* caster, SpellInfo const* spell)
                 }
                 //me->SetSpeedRate(MOVE_FLIGHT, master->GetSpeedRate(MOVE_FLIGHT) * 1.37f);
                 //me->SetSpeedRate(MOVE_RUN, master->GetSpeedRate(MOVE_FLIGHT) * 1.37f);
-                me->m_movementInfo.SetMovementFlags(MOVEMENTFLAG_FLYING);
             }
             else
                 me->SetSpeedRate(MOVE_RUN, master->GetSpeedRate(MOVE_RUN) * 1.1f);
@@ -16588,7 +16610,6 @@ void bot_ai::OnBotEnterVehicle(Vehicle const* vehicle)
                 case CREATURE_OCULUS_DRAKE_AMBER:
                     vehicle->GetBase()->SetCanFly(true);
                     vehicle->GetBase()->SetDisableGravity(true);
-                    vehicle->GetBase()->m_movementInfo.SetMovementFlags(MOVEMENTFLAG_FLYING);
                     break;
                 default:
                     break;
