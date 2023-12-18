@@ -212,7 +212,7 @@ public:
                 Creature* ill = ObjectAccessor::GetCreature(*me, *itr);
                 if (!ill)
                 {
-                    TC_LOG_ERROR("entities.player", "bm_bot::IllusionsCheck(): unit %s is not found in world!", (*itr).ToString().c_str());
+                    TC_LOG_ERROR("entities.player", "bm_bot::IllusionsCheck(): unit {} is not found in world!", (*itr).ToString());
                     continue;
                 }
 
@@ -289,6 +289,7 @@ public:
         {
             if (!bot_ai::StartAttack(u, force))
                 return;
+
             GetInPosition(force, u);
         }
 
@@ -320,6 +321,10 @@ public:
                 return;
 
             StartAttack(mytar, IsMelee());
+
+            CheckAttackState();
+            if (!me->IsAlive() || !mytar->IsAlive())
+                return;
 
             MoveBehind(mytar);
         }

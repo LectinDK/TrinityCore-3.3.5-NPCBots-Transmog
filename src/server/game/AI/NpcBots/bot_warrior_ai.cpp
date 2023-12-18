@@ -3,6 +3,7 @@
 #include "botspell.h"
 #include "bottext.h"
 #include "bottraits.h"
+#include "Containers.h"
 #include "Group.h"
 #include "Item.h"
 #include "Map.h"
@@ -411,8 +412,12 @@ public:
 
             StartAttack(mytar, IsMelee());
 
-            bool const isFury = _spec == BOT_SPEC_WARRIOR_FURY;
-            bool const isArms = _spec == BOT_SPEC_WARRIOR_ARMS;
+            CheckAttackState();
+            if (!me->IsAlive() || !mytar->IsAlive())
+                return;
+
+            bool const isFury = GetSpec() == BOT_SPEC_WARRIOR_FURY;
+            bool const isArms = GetSpec() == BOT_SPEC_WARRIOR_ARMS;
 
             //Keep stance in combat
             if (stancetimer <= diff && Rand() < 10 + 15 * (me->GetPower(POWER_RAGE) <= 250))
@@ -516,7 +521,9 @@ public:
             //TAUNT //No GCD
             if (IsSpellReady(TAUNT_1, diff, false) && u && u != me && Rand() < 50 && dist < 30 &&
                 mytar->CanHaveThreatList() && !CCed(mytar) && !mytar->HasAuraType(SPELL_AURA_MOD_TAUNT) &&
-                (!IsTank(u) || (IsTank() && GetHealthPCT(u) < 30 && GetHealthPCT(me) > 67)) &&
+                (!IsTank(u) || (IsTank() && GetHealthPCT(me) > 67 &&
+                (GetHealthPCT(u) < 30 || (IsOffTank() && !IsOffTank(u) && IsPointedOffTankingTarget(mytar)) ||
+                (!IsOffTank() && IsOffTank(u) && IsPointedTankingTarget(mytar))))) &&
                 ((!IsTankingClass(u->GetClass()) && (GetHealthPCT(u) < 80 || _inStance(2))) || IsTank()) &&
                 IsInBotParty(u) &&
                 (_inStance(2) || (stancetimer <= diff && stanceChange(diff, 2))))
@@ -639,7 +646,7 @@ public:
             //SHOCKWAVE - frontal cone
             if (IsSpellReady(SHOCKWAVE_1, diff) && can_do_normal && HasRole(BOT_ROLE_DPS) && dist < 8.f && !CCed(mytar) &&
                 rage >= rcost(SHOCKWAVE_1) && Rand() < (70 + 70 * mytar->IsNonMeleeSpellCast(false)) &&
-                me->HasInArc(float(M_PI)/2, mytar) && mytar->IsWithinLOSInMap(me))
+                me->HasInArc(float(M_PI)/2, mytar) && mytar->IsWithinLOSInMap(me, LINEOFSIGHT_ALL_CHECKS, VMAP::ModelIgnoreFlags::M2))
             {
                 if (doCast(me, GetSpell(SHOCKWAVE_1)))
                     return;
@@ -880,7 +887,7 @@ public:
             //WHIRLWIND
             if (IsSpellReady(WHIRLWIND_1, diff) && can_do_normal && HasRole(BOT_ROLE_DPS) && !IsTank() && !CanBlock() && Rand() < 80 &&
                 (isFury || mytar->IsControlledByPlayer() || me->GetLevel() < 60 || !me->GetMap()->IsDungeon()) &&
-                (_inStance(3) || stancetimer <= diff) && dist < 7.f &&
+                (_inStance(3) || stancetimer <= diff) && dist < 6.f &&
                 rage >= rcost(WHIRLWIND_1) && (isFury || rage >= 500 || FindSplashTarget(7.f, mytar, 15.f)))
             {
                 if ((_inStance(3) || stanceChange(diff, 3)) &&
@@ -931,7 +938,7 @@ public:
 
         void CheckShouts(uint32 diff)
         {
-            if (shoutCheckTimer > diff || GC_Timer > diff || Rand() > 35 || IAmFree() || me->IsMounted() || IsCasting() ||
+            if (shoutCheckTimer > diff || GC_Timer > diff || Rand() > 35 || (IAmFree() && !IsWanderer()) || me->IsMounted() || IsCasting() ||
                 (rage < rcost(BATTLE_SHOUT_1) && !IsSpellReady(BLOODRAGE_1, diff, false)))
                 return;
 
@@ -1002,16 +1009,13 @@ public:
 
         void CheckVigilance(uint32 diff)
         {
-            if (vigiCheckTimer > diff || Rand() > 30 || !IsSpellReady(VIGILANCE_1, diff) || me->IsInCombat() ||
-                me->IsMounted() || IsCasting())
+            if (vigiCheckTimer > diff || Rand() > 30 || !IsSpellReady(VIGILANCE_1, diff) || me->IsInCombat() || me->IsMounted() || IsCasting())
                 return;
 
-            vigiCheckTimer = urand(1000, 3000);
+            vigiCheckTimer = urand(1500, 3000);
             uint32 VIGILANCE = GetSpell(VIGILANCE_1);
 
-            Unit* u = vigilanceTargetGuid ? ObjectAccessor::GetUnit(*me, vigilanceTargetGuid) : nullptr;
-
-            if (u)
+            if (Unit* u = vigilanceTargetGuid ? ObjectAccessor::GetUnit(*me, vigilanceTargetGuid) : nullptr)
             {
                 bool myVig = u->HasAura(VIGILANCE, me->GetGUID());
                 if (!IsTank() || !myVig)
@@ -1025,165 +1029,89 @@ public:
             else if (vigilanceTargetGuid)
                 vigilanceTargetGuid = ObjectGuid::Empty;
 
-            if (IAmFree() || !IsTank())
+            if (!IAmFree() && !IsTank())
                 return;
 
-            Group const* gr = master->GetGroup();
-            if (gr)
+            Unit* target = nullptr;
+            if (Group const* gr = GetGroup())
             {
-                //tanks
-                for (GroupReference const* itr = gr->GetFirstMember(); itr != nullptr; itr = itr->next())
+                std::set<Unit*> targets;
+                for (uint8 i = 0; i < 4 && !targets.empty(); ++i)
                 {
-                    Player* pPlayer = itr->GetSource();
-                    if (!pPlayer || !pPlayer->IsInWorld()) continue;
-                    if (me->GetMapId() != pPlayer->GetMapId()) continue;
-                    if (pPlayer->IsAlive() && IsTankingClass(pPlayer->GetClass()) && me->GetDistance(pPlayer) < 30 &&
-                        !pPlayer->HasAura(VIGILANCE) && !pPlayer->HasAura(DAMAGE_REDUCTION))
+                    for (Unit* member : BotMgr::GetAllGroupMembers(gr))
                     {
-                        u = pPlayer;
-                        break;
+                        if (!(!(i & 1) ? member->IsPlayer() : member->IsNPCBot()) || me->GetMap() != member->FindMap() ||
+                            !member->IsAlive() || me->GetDistance(member) > 30 ||
+                            (member->IsNPCBot() && member->ToCreature()->IsTempBot()) ||
+                            (i < 2 && !(i == 0 ? IsTankingClass(member->GetClass()) : IsTank(member))) ||
+                            (i == 3 && !member->ToCreature()->GetBotAI()->HasRole(BOT_ROLE_DPS)) ||
+                            member->HasAura(VIGILANCE) || member->HasAura(DAMAGE_REDUCTION))
+                            continue;
+                        targets.insert(member);
                     }
                 }
-                if (!u)
-                {
-                    for (GroupReference const* itr = gr->GetFirstMember(); itr != nullptr; itr = itr->next())
-                    {
-                        Player const* pPlayer = itr->GetSource();
-                        if (!pPlayer || !pPlayer->IsInWorld() || !pPlayer->HaveBot()) continue;
-                        if (me->GetMapId() != pPlayer->GetMapId()) continue;
-                        BotMap const* map = pPlayer->GetBotMgr()->GetBotMap();
-                        for (BotMap::const_iterator it = map->begin(); it != map->end(); ++it)
-                        {
-                            Creature* cre = it->second;
-                            if (!cre || cre == me || !cre->IsInWorld() || !cre->IsAlive()) continue;
-                            if (cre->GetBotAI()->HasRole(BOT_ROLE_TANK) &&
-                                me->GetDistance(cre) < 30 && !cre->HasAura(VIGILANCE) && !cre->HasAura(DAMAGE_REDUCTION))
-                            {
-                                u = cre;
-                                break;
-                            }
-                        }
-                    }
-                }
-                //any players
-                if (!u)
-                {
-                    for (GroupReference const* itr = gr->GetFirstMember(); itr != nullptr; itr = itr->next())
-                    {
-                        Player* pPlayer = itr->GetSource();
-                        if (!pPlayer || !pPlayer->IsInWorld() || pPlayer == master) continue;
-                        if (me->GetMapId() != pPlayer->GetMapId()) continue;
-                        if (pPlayer->IsAlive() && me->GetDistance(pPlayer) < 30 &&
-                            !pPlayer->HasAura(VIGILANCE))
-                        {
-                            u = pPlayer;
-                            break;
-                        }
-                    }
-                }
-                //damage-dealing bots
-                if (!u)
-                {
-                    for (GroupReference const* itr = gr->GetFirstMember(); itr != nullptr; itr = itr->next())
-                    {
-                        Player const* pPlayer = itr->GetSource();
-                        if (!pPlayer || !pPlayer->IsInWorld() || !pPlayer->HaveBot()) continue;
-                        if (me->GetMapId() != pPlayer->GetMapId()) continue;
-                        BotMap const* map = pPlayer->GetBotMgr()->GetBotMap();
-                        for (BotMap::const_iterator it = map->begin(); it != map->end(); ++it)
-                        {
-                            Creature* cre = it->second;
-                            if (!cre || cre == me || !cre->IsInWorld() || !cre->IsAlive() || cre->IsTempBot()) continue;
-                            if (cre->GetBotAI()->HasRole(BOT_ROLE_DPS) && me->GetDistance(cre) < 30 &&
-                                !cre->HasAura(VIGILANCE))
-                            {
-                                u = cre;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            if (!u && master->IsAlive() && me->IsWithinDistInMap(master, 30) && !master->HasAura(VIGILANCE))
-                u = master;
 
-            if (u && doCast(u, VIGILANCE))
+                if (!targets.empty())
+                    target = targets.size() == 1 ? *targets.begin() : Trinity::Containers::SelectRandomContainerElement(targets);
+            }
+
+            if (!target && !IAmFree() && master->IsAlive() && me->IsWithinDistInMap(master, 30) && !master->HasAura(VIGILANCE))
+                target = master;
+
+            if (target && doCast(target, VIGILANCE))
                 return;
         }
 
         void CheckIntervene(uint32 diff)
         {
-            //lvl 70 - warbringer always present
-            if (IsSpellReady(INTERVENE_1, diff, false) && !HasBotCommandState(BOT_COMMAND_STAY) &&
-                !me->IsMounted() && rage >= rcost(INTERVENE_1) &&
-                !IAmFree() && !IsCasting() && Rand() < (IsTank() ? 40 : 80))
+            if (!IsSpellReady(INTERVENE_1, diff, false) || HasBotCommandState(BOT_COMMAND_STAY) || me->IsMounted() ||
+                Rand() > (IsTank() ? 40 : 80) || rage < rcost(INTERVENE_1) || IsCasting() ||
+                !(_inStance(2) || stancetimer <= diff || (GetSpec() == BOT_SPEC_WARRIOR_PROTECTION && me->GetLevel() >= 50)))
+                return;
+
+            Unit* target = nullptr;
+            if (!me->GetVictim() && master->getAttackers().empty() && master->isMoving())
             {
-                if (!me->GetVictim() && master->getAttackers().empty() && master->isMoving())
+                float mydist = me->GetDistance(master);
+                if (mydist < 25 && mydist > 18)
+                    target = master;
+            }
+
+            Group const* gr = GetGroup();
+            if (!target && !gr)
+            {
+                if (GetHealthPCT(master) < 95 && !master->getAttackers().empty() &&
+                    me->getAttackers().size() <= master->getAttackers().size())
                 {
                     float mydist = me->GetDistance(master);
-                    if (mydist < 25 && mydist > 18)
-                    {
-                        if (doCast(master, GetSpell(INTERVENE_1)))
-                            return;
-                    }
+                    if (mydist < 25 && mydist > 8)
+                        target = master;
                 }
-                Group const* gr = master->GetGroup();
-                if (!gr)
-                {
-                    if (GetHealthPCT(master) < 95 && !master->getAttackers().empty() &&
-                        me->getAttackers().size() <= master->getAttackers().size())
-                    {
-                        float mydist = me->GetDistance(master);
-                        if (mydist < 25 && mydist > 8)
-                        {
-                            if (doCast(master, GetSpell(INTERVENE_1)))
-                                return;
-                        }
-                    }
-                }
-                else if (!IsTank() || !me->GetVictim())
-                {
-                    bool Bots = false;
-                    float dist;
-                    for (GroupReference const* itr = gr->GetFirstMember(); itr != nullptr; itr = itr->next())
-                    {
-                        Player* tPlayer = itr->GetSource();
-                        if (!tPlayer || tPlayer->IsBeingTeleported() || tPlayer->FindMap() != me->GetMap()) continue;
-                        if (tPlayer->HaveBot())
-                            Bots = true;
-                        if (!tPlayer->IsAlive() || GetHealthPCT(tPlayer) > 70 ||
-                            tPlayer->HasAuraType(SPELL_AURA_ADD_CASTER_HIT_TRIGGER)) continue;
-                        if (tPlayer->getAttackers().size() < me->getAttackers().size()) continue;
-                        dist = me->GetDistance(tPlayer);
-                        if (dist > 25 || dist < 8) continue;
-
-                        if (doCast(tPlayer, GetSpell(INTERVENE_1)))
-                            return;
-                    }
-                    if (!Bots) return;
-                    for (GroupReference const* itr = gr->GetFirstMember(); itr != nullptr; itr = itr->next())
-                    {
-                        Player* tPlayer = itr->GetSource();
-                        if (!tPlayer || !tPlayer->HaveBot() || tPlayer->IsBeingTeleported() || tPlayer->FindMap() != me->GetMap()) continue;
-                        BotMap const* map = tPlayer->GetBotMgr()->GetBotMap();
-                        for (BotMap::const_iterator it = map->begin(); it != map->end(); ++it)
-                        {
-                            Creature* bot = it->second;
-                            if (bot == me || !bot->IsInWorld() || !bot->IsAlive() || bot->IsTempBot()) continue;
-                            if (GetHealthPCT(bot) > (70 - 30 * IsTank(bot)) ||
-                                bot->HasAuraType(SPELL_AURA_ADD_CASTER_HIT_TRIGGER)) continue;
-                            if (bot->getAttackers().size() <= me->getAttackers().size()) continue;
-                            dist = me->GetDistance(bot);
-                            if (dist > 25 || dist < 8) continue;
-
-                            if (doCast(bot, GetSpell(INTERVENE_1)))
-                                return;
-                        }
-                    }
-                }
-
-                SetSpellCooldown(INTERVENE_1, 500); //fail
             }
+            if (!target && gr && (!IsTank() || !me->GetVictim()))
+            {
+                std::set<Unit*> targets;
+                for (Unit* member : BotMgr::GetAllGroupMembers(gr))
+                {
+                    if (me->GetMap() == member->FindMap() && member->IsAlive() && GetHealthPCT(member) <= 70 &&
+                        !member->HasAuraType(SPELL_AURA_ADD_CASTER_HIT_TRIGGER) &&
+                        member->getAttackers().size() >= me->getAttackers().size() &&
+                        !(member->IsNPCBot() && member->ToCreature()->IsTempBot()))
+                    {
+                        float dist = me->GetDistance(member);
+                        if (dist < 25 && dist > 8)
+                            targets.insert(member);
+                    }
+                }
+                if (!targets.empty())
+                    target = targets.size() == 1u ? *targets.begin() : Trinity::Containers::SelectRandomContainerElement(targets);
+            }
+
+            if (target && (_inStance(2) || (GetSpec() == BOT_SPEC_WARRIOR_PROTECTION && me->GetLevel() >= 50) || stanceChange(diff, 2)) &&
+                doCast(target, GetSpell(INTERVENE_1)))
+                return;
+
+            SetSpellCooldown(INTERVENE_1, 500); //fail
         }
 
         void CheckSpellReflect(uint32 diff)
@@ -1277,7 +1205,7 @@ public:
             {
                 //!!!Melee spell damage is not yet critical, all reduced by half
                 //Poleaxe Specialization: 5% additional critical damage for all attacks
-                if (_spec == BOT_SPEC_WARRIOR_ARMS && me->GetLevel() >= 30)
+                if (GetSpec() == BOT_SPEC_WARRIOR_ARMS && me->GetLevel() >= 30)
                     if (Item const* weap = GetEquips(uint8(damageinfo.AttackType)))
                         if (ItemTemplate const* proto = weap->GetTemplate())
                             if (proto->SubClass == ITEM_SUBCLASS_WEAPON_AXE || proto->SubClass == ITEM_SUBCLASS_WEAPON_AXE2 ||
@@ -1307,7 +1235,7 @@ public:
                         crit_chance += 25.f;
 
             //Poleaxe Specialization: 5% additional critical chance for all attacks
-            if (_spec == BOT_SPEC_WARRIOR_ARMS && lvl >= 30)
+            if (GetSpec() == BOT_SPEC_WARRIOR_ARMS && lvl >= 30)
                 if (Item const* weap = GetEquips(uint8(attackType)))
                     if (ItemTemplate const* proto = weap->GetTemplate())
                         if (proto->SubClass == ITEM_SUBCLASS_WEAPON_AXE || proto->SubClass == ITEM_SUBCLASS_WEAPON_AXE2 ||
@@ -1315,15 +1243,15 @@ public:
                             crit_chance += 5.f;
 
             //Incite: 15% additional critical chance for Cleave, Heroic Strike and Thunder Clap
-            if (((_spec == BOT_SPEC_WARRIOR_PROTECTION && lvl >= 15) ||
-                ((_spec == BOT_SPEC_WARRIOR_ARMS || _spec == BOT_SPEC_WARRIOR_FURY) && lvl >= 75)) &&
+            if (((GetSpec() == BOT_SPEC_WARRIOR_PROTECTION && lvl >= 15) ||
+                ((GetSpec() == BOT_SPEC_WARRIOR_ARMS || GetSpec() == BOT_SPEC_WARRIOR_FURY) && lvl >= 75)) &&
                 (baseId == CLEAVE_1 || baseId == HEROIC_STRIKE_1 || baseId == THUNDER_CLAP_1))
                 crit_chance += 15.f;
             //Improved Overpower: 50% additional critical chance for Overpower
-            if ((_spec == BOT_SPEC_WARRIOR_ARMS) && lvl >= 20 && baseId == OVERPOWER_1)
+            if ((GetSpec() == BOT_SPEC_WARRIOR_ARMS) && lvl >= 20 && baseId == OVERPOWER_1)
                 crit_chance += 50.f;
             //Critical Block: 15% additional critical chance for Shield Slam
-            if ((_spec == BOT_SPEC_WARRIOR_PROTECTION) &&
+            if ((GetSpec() == BOT_SPEC_WARRIOR_PROTECTION) &&
                 lvl >= 50 && baseId == SHIELD_SLAM_1)
                 crit_chance += 15.f;
             //Sword and Board: 15% additional critical chance for Devastate
@@ -1354,7 +1282,7 @@ public:
                 if (lvl >= 20)
                     pctbonus *= 1.1f;
                 //Poleaxe Specialization: 5% additional critical damage for all attacks
-                if ((_spec == BOT_SPEC_WARRIOR_PROTECTION) && lvl >= 30)
+                if ((GetSpec() == BOT_SPEC_WARRIOR_PROTECTION) && lvl >= 30)
                     if (Item const* weap = GetEquips(uint8(attackType)))
                         if (ItemTemplate const* proto = weap->GetTemplate())
                             if (proto->SubClass == ITEM_SUBCLASS_WEAPON_AXE || proto->SubClass == ITEM_SUBCLASS_WEAPON_AXE2 ||
@@ -1376,23 +1304,23 @@ public:
             if (lvl >= 10 && baseId == THUNDER_CLAP_1)
                 pctbonus *= 1.3f;
             //Improved Revenge (part 1): 60% bonus damage for Revenge
-            if ((_spec == BOT_SPEC_WARRIOR_PROTECTION) && lvl >= 20 && baseId == REVENGE_1)
+            if ((GetSpec() == BOT_SPEC_WARRIOR_PROTECTION) && lvl >= 20 && baseId == REVENGE_1)
                 pctbonus *= 1.6f;
             //Gag Order (part 2): 10% bonus damage for Shield Slam
-            if ((_spec == BOT_SPEC_WARRIOR_PROTECTION) && lvl >= 30 && baseId == SHIELD_SLAM_1)
+            if ((GetSpec() == BOT_SPEC_WARRIOR_PROTECTION) && lvl >= 30 && baseId == SHIELD_SLAM_1)
                 pctbonus *= 1.1f;
             //Improved Whirlwind: 20% bonus damage for Whirlwind
-            if ((_spec == BOT_SPEC_WARRIOR_FURY) && lvl >= 40 && baseId == WHIRLWIND_1)
+            if ((GetSpec() == BOT_SPEC_WARRIOR_FURY) && lvl >= 40 && baseId == WHIRLWIND_1)
                 pctbonus *= 1.2f;
             //Improved Mortal Strike (part 1): 10% bonus damage for Mortal Strike
             if (lvl >= 45 && baseId == MORTAL_STRIKE_1)
                 pctbonus *= 1.1f;
             //Unrelenting Assault (part 2): 20% bonus damage for Overpower and Revenge
-            if ((_spec == BOT_SPEC_WARRIOR_ARMS) &&
+            if ((GetSpec() == BOT_SPEC_WARRIOR_ARMS) &&
                 lvl >= 45 && (baseId == OVERPOWER_1 || baseId == REVENGE_1))
                 pctbonus *= 1.2f;
             //Unending Fury: 10% bonus damage for Whirlwind, Slam and Bloodthirst
-            if ((_spec == BOT_SPEC_WARRIOR_FURY) &&
+            if ((GetSpec() == BOT_SPEC_WARRIOR_FURY) &&
                 lvl >= 55 && (baseId == WHIRLWIND_1 || baseId == SLAM_1 || baseId == BLOODTHIRST_1))
                 pctbonus *= 1.1f;
 
@@ -1411,7 +1339,7 @@ public:
                 pctbonus *= 1.2f;
 
             //Improved Cleave: 120% increased '!bonus damage!' done by Cleave (flat mod)
-            if ((_spec == BOT_SPEC_WARRIOR_FURY) && lvl >= 25 && baseId == CLEAVE_1)
+            if ((GetSpec() == BOT_SPEC_WARRIOR_FURY) && lvl >= 25 && baseId == CLEAVE_1)
             {
                 float bp = spellInfo->_effects[EFFECT_0].BasePoints; //SPELL_EFFECT_WEAPON_DAMAGE (values: 15 - 222)
                 fdamage += bp * 1.2;
@@ -1458,15 +1386,15 @@ public:
             if (lvl >= 10 && baseId == THUNDER_CLAP_1)
                 fcost -= 40;
             //Improved Execute: -5 rage cost for Execute
-            if ((_spec == BOT_SPEC_WARRIOR_FURY) &&
+            if ((GetSpec() == BOT_SPEC_WARRIOR_FURY) &&
                 lvl >= 25 && baseId == EXECUTE_1)
                 fcost -= 50;
             //Puncture: -3 rage cost for Sunder Armor and Devastate
-            if ((_spec == BOT_SPEC_WARRIOR_PROTECTION) &&
+            if ((GetSpec() == BOT_SPEC_WARRIOR_PROTECTION) &&
                 lvl >= 25 && (baseId == SUNDER_ARMOR_1 || baseId == DEVASTATE_1))
                 fcost -= 30;
             //Focused Rage: -3 rage cost for all offensive abilities (using rage)
-            if ((_spec == BOT_SPEC_WARRIOR_PROTECTION) &&
+            if ((GetSpec() == BOT_SPEC_WARRIOR_PROTECTION) &&
                 lvl >= 40 && ((spellInfo->SpellFamilyFlags[0] & 0x6E6E4EEE) || (spellInfo->SpellFamilyFlags[1] & 0x40E664)))
                 fcost -= 30;
 
@@ -1497,7 +1425,7 @@ public:
 
             //flat mods
             //Improved Slam: -1.0 sec cast time for Slam
-            if ((_spec == BOT_SPEC_WARRIOR_ARMS) &&
+            if ((GetSpec() == BOT_SPEC_WARRIOR_ARMS) &&
                 lvl >= 40 && baseId == SLAM_1)
                 casttime -= 1000;
 
@@ -1514,7 +1442,7 @@ public:
 
             //pct mods
             //Intensify Rage: -33% cooldown for Bloodrage, Berserker Rage, Recklessness and Death Wish
-            if ((_spec == BOT_SPEC_WARRIOR_FURY) && lvl >= 40 &&
+            if ((GetSpec() == BOT_SPEC_WARRIOR_FURY) && lvl >= 40 &&
                 (baseId == BLOODRAGE_1 || baseId == BERSERKER_RAGE_1 || baseId == RECKLESSNESS_1 || baseId == DEATH_WISH_1))
                 pctbonus *= 0.67f;
 
@@ -1524,11 +1452,11 @@ public:
                 cooldown -= 120000;
 
             //Shield Mastery (part 2): -20 sec cooldown for Shield Block
-            if ((_spec == BOT_SPEC_WARRIOR_PROTECTION) &&
+            if ((GetSpec() == BOT_SPEC_WARRIOR_PROTECTION) &&
                 lvl >= 20 && baseId == SHIELD_BLOCK_1)
                 cooldown -= 20000;
             //Improved Disciplines: -60 sec cooldown for Shield Wall, Retaliation and Recklessness
-            if ((_spec == BOT_SPEC_WARRIOR_PROTECTION) &&
+            if ((GetSpec() == BOT_SPEC_WARRIOR_PROTECTION) &&
                 lvl >= 35 && (baseId == SHIELD_WALL_1 || baseId == RETALIATION_1 || baseId == RECKLESSNESS_1))
                 cooldown -= 60000;
 
@@ -1557,18 +1485,18 @@ public:
 
             //flat bonuses
             //Improved Disarm part 1: -20 sec cooldown for Disarm
-            if ((_spec == BOT_SPEC_WARRIOR_PROTECTION) &&
+            if ((GetSpec() == BOT_SPEC_WARRIOR_PROTECTION) &&
                 lvl >= 25 && baseId == DISARM_1)
                 cooldown -= 20000;
             //Improved Intercept: -10 sec cooldown for Intercept
-            if ((_spec == BOT_SPEC_WARRIOR_FURY) &&
+            if ((GetSpec() == BOT_SPEC_WARRIOR_FURY) &&
                 lvl >= 30 && baseId == INTERCEPT_1)
                 cooldown -= 10000;
             //Improved Mortal Strike (part 2): -1 sec cooldown for Mortal Strike
             if (lvl >= 45 && baseId == MORTAL_STRIKE_1)
                 cooldown -= 1000;
             //Unrelenting Assault (part 1): -4 sec cooldown for Overpower and Revenge
-            if ((_spec == BOT_SPEC_WARRIOR_ARMS) &&
+            if ((GetSpec() == BOT_SPEC_WARRIOR_ARMS) &&
                 lvl >= 45 && (baseId == OVERPOWER_1 || baseId == REVENGE_1))
                 cooldown -= 4000;
 
@@ -1594,7 +1522,7 @@ public:
             uint8 lvl = me->GetLevel();
 
             //Unrelenting Assault (part 1, special): -0.5 sec global cooldown for Overpower and Revenge
-            if ((_spec == BOT_SPEC_WARRIOR_ARMS) &&
+            if ((GetSpec() == BOT_SPEC_WARRIOR_ARMS) &&
                 lvl >= 45 && (baseId == OVERPOWER_1 || baseId == REVENGE_1))
                 cooldown -= 500.f;
         }
@@ -1740,7 +1668,7 @@ public:
                     //Improved Thunder Clap (part 3): 10% extra slow
                     amount += (-10);
                     //Conqueror Thunder Clap Bonus: 50% increased effect
-                    if ((_spec == BOT_SPEC_WARRIOR_PROTECTION) && lvl >= 60)
+                    if ((GetSpec() == BOT_SPEC_WARRIOR_PROTECTION) && lvl >= 60)
                         amount = amount + amount / 2;
 
                     clap->ChangeAmount(amount);
@@ -1789,7 +1717,7 @@ public:
                 if (lvl >= 25 && target->GetTypeId() != TYPEID_PLAYER && urand(1,100) <= 25)
                     me->CastSpell(target, REVENGE_STUN_SPELL, true);
             }
-            if (baseId == DISARM_1 && (_spec == BOT_SPEC_WARRIOR_PROTECTION) && lvl >= 25)
+            if (baseId == DISARM_1 && (GetSpec() == BOT_SPEC_WARRIOR_PROTECTION) && lvl >= 25)
             {
                 //Improved Disarm part 2
                 if (AuraEffect* disa = target->GetAuraEffect(spellId, 1, me->GetGUID()))
@@ -1799,7 +1727,7 @@ public:
             {
                 me->ClearReactive(REACTIVE_OVERPOWER);
                 //Unrelenting Assault (part 3): reduce spells efficiency on players
-                if (lvl >= 45 && (_spec == BOT_SPEC_WARRIOR_ARMS) &&
+                if (lvl >= 45 && (GetSpec() == BOT_SPEC_WARRIOR_ARMS) &&
                     target->GetTypeId() == TYPEID_PLAYER && target->IsNonMeleeSpellCast(false, false, true))
                 {
                     CastSpellExtraArgs args(true);
@@ -1836,7 +1764,7 @@ public:
                     }
                 }
             }
-            if (baseId == SHIELD_BASH_1 && (_spec == BOT_SPEC_WARRIOR_PROTECTION) && lvl >= 30)
+            if (baseId == SHIELD_BASH_1 && (GetSpec() == BOT_SPEC_WARRIOR_PROTECTION) && lvl >= 30)
             {
                 //Gag Order part 1: silence target
                 me->CastSpell(target, GAG_ORDER_DEBUFF, true);
@@ -1847,7 +1775,7 @@ public:
                 me->RemoveAura(VICTORIOUS_SPELL);
             }
             if ((baseId == DEVASTATE_1 || baseId == REVENGE_1) &&
-                (_spec == BOT_SPEC_WARRIOR_PROTECTION) &&
+                (GetSpec() == BOT_SPEC_WARRIOR_PROTECTION) &&
                 lvl >= 55 && urand(1,100) <= 30)
             {
                 //Sword and Board: trigger
@@ -1893,7 +1821,7 @@ public:
             }
 
             //Iron Will: -20% duration for stuns and charms
-            if ((_spec == BOT_SPEC_WARRIOR_ARMS || _spec == BOT_SPEC_WARRIOR_FURY) &&
+            if ((GetSpec() == BOT_SPEC_WARRIOR_ARMS || GetSpec() == BOT_SPEC_WARRIOR_FURY) &&
                 lvl >= 15 && !spell->IsPositive() && (spell->Mechanic == MECHANIC_STUN || spell->Mechanic == MECHANIC_CHARM))
             {
                 if (Aura* chun = me->GetAura(spellId, caster->GetGUID()))
@@ -1951,11 +1879,11 @@ public:
         void DamageDealt(Unit* victim, uint32& damage, DamageEffectType damageType) override
         {
             //Unbridled Wrath
-            if ((_spec == BOT_SPEC_WARRIOR_FURY || _spec == BOT_SPEC_WARRIOR_ARMS) &&
+            if ((GetSpec() == BOT_SPEC_WARRIOR_FURY || GetSpec() == BOT_SPEC_WARRIOR_ARMS) &&
                 damage && me->GetLevel() >= 15 && me->CanDualWield() &&
                 (damageType == DIRECT_DAMAGE || damageType == SPELL_DIRECT_DAMAGE))
             {
-                if (roll_chance_f(me->GetPPMProcChance(me->GetFloatValue(UNIT_FIELD_BASEATTACKTIME+BASE_ATTACK), 15.f, nullptr)))
+                if (roll_chance_f(me->GetPPMProcChance(me->GetFloatValue(UNIT_FIELD_BASEATTACKTIME), 15.f, nullptr)))
                     me->CastSpell(me, UNBRIDLED_WRATH_EFFECT, true);
             }
             bot_ai::DamageDealt(victim, damage, damageType);
@@ -2030,9 +1958,9 @@ public:
         void InitSpells() override
         {
             uint8 lvl = me->GetLevel();
-            bool isArms = _spec == BOT_SPEC_WARRIOR_ARMS;
-            bool isFury = _spec == BOT_SPEC_WARRIOR_FURY;
-            bool isProt = _spec == BOT_SPEC_WARRIOR_PROTECTION;
+            bool isArms = GetSpec() == BOT_SPEC_WARRIOR_ARMS;
+            bool isFury = GetSpec() == BOT_SPEC_WARRIOR_FURY;
+            bool isProt = GetSpec() == BOT_SPEC_WARRIOR_PROTECTION;
 
             InitSpellMap(BATTLE_STANCE_1);
    /*Quest*/lvl >= 10 ? InitSpellMap(DEFENSIVE_STANCE_1) : RemoveSpell(DEFENSIVE_STANCE_1);
@@ -2094,9 +2022,9 @@ public:
         void ApplyClassPassives() const override
         {
             uint8 level = master->GetLevel();
-            bool isArms = _spec == BOT_SPEC_WARRIOR_ARMS;
-            bool isFury = _spec == BOT_SPEC_WARRIOR_FURY;
-            bool isProt = _spec == BOT_SPEC_WARRIOR_PROTECTION;
+            bool isArms = GetSpec() == BOT_SPEC_WARRIOR_ARMS;
+            bool isFury = GetSpec() == BOT_SPEC_WARRIOR_FURY;
+            bool isProt = GetSpec() == BOT_SPEC_WARRIOR_PROTECTION;
 
             RefreshAura(DEEP_WOUNDS_3, (isArms || isFury) && level >= 24 ? 1 : 0);
             RefreshAura(DEEP_WOUNDS_2, (isArms || isFury) && level >= 23 && level < 24 ? 1 : 0);
@@ -2199,7 +2127,7 @@ public:
             }
 
             //Mace Specialization: 15% armor penetration
-            if (_spec == BOT_SPEC_WARRIOR_ARMS && me->GetLevel() >= 30)
+            if (GetSpec() == BOT_SPEC_WARRIOR_ARMS && me->GetLevel() >= 30)
                 if (Item const* weap = GetEquips(BOT_SLOT_MAINHAND))
                     if (ItemTemplate const* proto = weap->GetTemplate())
                         if (proto->SubClass == ITEM_SUBCLASS_WEAPON_MACE || proto->SubClass == ITEM_SUBCLASS_WEAPON_MACE2)
@@ -2242,7 +2170,7 @@ public:
         void _checkSwordSpec() const
         {
             uint8 level = me->GetLevel();
-            bool isArms = _spec == BOT_SPEC_WARRIOR_ARMS;
+            bool isArms = GetSpec() == BOT_SPEC_WARRIOR_ARMS;
             Item const* mhWeap = GetEquips(BOT_SLOT_MAINHAND);
             uint32 weaponSubClass = mhWeap ? mhWeap->GetTemplate()->SubClass : uint32(ITEM_SUBCLASS_WEAPON_WAND);
             bool sword = (weaponSubClass == ITEM_SUBCLASS_WEAPON_SWORD || weaponSubClass == ITEM_SUBCLASS_WEAPON_SWORD2);

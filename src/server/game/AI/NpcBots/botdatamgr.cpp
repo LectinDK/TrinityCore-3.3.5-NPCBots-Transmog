@@ -1,7 +1,11 @@
+#include "BattlegroundMgr.h"
+#include "BattlegroundQueue.h"
 #include "bot_ai.h"
 #include "botdatamgr.h"
 #include "botmgr.h"
 #include "botspell.h"
+#include "botwanderful.h"
+#include "bpet_ai.h"
 #include "Containers.h"
 #include "Creature.h"
 #include "DatabaseEnv.h"
@@ -11,7 +15,11 @@
 #include "Map.h"
 #include "MapManager.h"
 #include "ObjectMgr.h"
+#include "ScriptMgr.h"
+#include "SpellInfo.h"
+#include "SpellMgr.h"
 #include "StringConvert.h"
+#include "World.h"
 #include "WorldDatabase.h"
 /*
 Npc Bot Data Manager by Trickerer (onlysuffering@gmail.com)
@@ -33,244 +41,631 @@ NpcBotExtrasMap _botsExtras;
 NpcBotTransmogDataMap _botsTransmogData;
 NpcBotRegistry _existingBots;
 
+std::map<uint32, uint8> _wpMinSpawnLevelPerMapId;
+std::map<uint32, uint8> _wpMaxSpawnLevelPerMapId;
+std::map<uint8, std::set<uint32>> _spareBotIdsPerClassMap;
 CreatureTemplateContainer _botsWanderCreatureTemplates;
 std::unordered_map<uint32, EquipmentInfo const*> _botsWanderCreatureEquipmentTemplates;
+std::list<std::pair<uint32, WanderNode const*>> _botsWanderCreaturesToSpawn;
+std::set<uint32> _botsWanderCreaturesToDespawn;
 
-static constexpr char const* WanderMapCreationQuery =
-    "CREATE TABLE IF NOT EXISTS `creature_wander_nodes` ("
-    "`id` int(10) unsigned NOT NULL,"
-    "`mapid` smallint(5) unsigned NOT NULL DEFAULT '0',"
-    "`zoneid` int(10) unsigned NOT NULL DEFAULT '0',"
-    "`x` float NOT NULL DEFAULT '0',"
-    "`y` float NOT NULL DEFAULT '0',"
-    "`z` float NOT NULL DEFAULT '0',"
-    "`o` float NOT NULL DEFAULT '0',"
-    "`name` varchar(100) COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT '',"
-    "PRIMARY KEY (`id`)"
-    ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Bot Wander Map'";
-static constexpr float NODE_CONNECTION_DIST_MAX = 1800.f;
-static constexpr float NODE_CONNECTION_DIST_MAX_GEN = 370.f;
-static constexpr std::array wanderMapIds{ 0u, 1u };
+ItemPerBotClassMap _botsWanderCreaturesSortedGear;
+
+typedef std::unordered_map<ObjectGuid /*playerGuid*/, BotBankItemContainer> BotGearStorageMap;
+BotGearStorageMap _botStoredGearMap;
 
 static bool allBotsLoaded = false;
 
-class BotTravelGraph
+static uint32 next_wandering_bot_spawn_delay = 0;
+
+static EventProcessor botSpawnEvents;
+static std::unordered_map<ObjectGuid, EventProcessor> botBGJoinEvents;
+
+bool BotBankItemCompare::operator()(Item const* item1, Item const* item2) const
 {
-public:
-    ~BotTravelGraph() {
-        //order
-        Tops.clear();
-        Nodes.clear();
-    }
-
-    struct BotTravelNode : public WorldLocation
-    {
-        BotTravelNode(uint32 _mapId = MAPID_INVALID, float x = 0.f, float y = 0.f, float z = 0.f, float o = 0.f,
-            uint32 _id = 0, uint32 _zoneId = 0, uint8 _minlevel = 0, uint8 _maxlevel = 0, std::string const& _name = "unknown") :
-            WorldLocation(_mapId, x, y, z, o), id(_id), zoneId(_zoneId), minlevel(_minlevel), maxlevel(_maxlevel), name(_name) {}
-        BotTravelNode(uint32 _mapId, Position const& pos, uint32 _id, uint32 _zoneId, uint8 _minlevel, uint8 _maxlevel, std::string const& _name) :
-            WorldLocation(_mapId, pos), id(_id), zoneId(_zoneId), minlevel(_minlevel), maxlevel(_maxlevel), name(_name) {}
-
-        uint32 id;
-        uint32 zoneId;
-        uint8 minlevel;
-        uint8 maxlevel;
-        std::string name;
-
-        std::vector<BotTravelNode*> connections;
-    };
-
-    std::unordered_map<uint32 /*mapId*/, std::unordered_map<uint32, BotTravelNode>> Nodes;
-    std::vector<BotTravelNode*> Tops; // single connection nodes
-
-    // debug
-    static constexpr size_t sizeofNode = sizeof(BotTravelNode);
-} static WanderMap;
-
-void GenerateWanderNodes()
-{
-    using NodeType = BotTravelGraph::BotTravelNode;
-
-    for (GameTeleContainer::value_type const& tele_pair : sObjectMgr->GetGameTeleMap())
-    {
-        GameTele const& tele = tele_pair.second;
-        if (std::find(std::cbegin(wanderMapIds), std::cend(wanderMapIds), tele.mapId) == wanderMapIds.cend())
-            continue;
-
-        Position pos(tele.position_x, tele.position_y, tele.position_z, tele.orientation);
-        uint32 teleZoneId = sMapMgr->GetZoneId(PHASEMASK_NORMAL, tele.mapId, pos);
-        auto [lvlmin, lvlmax] = BotDataMgr::GetZoneLevels(teleZoneId);
-        if (lvlmin == 0 || lvlmax == 0)
-            continue;
-
-        WanderMap.Nodes[tele.mapId][tele_pair.first] = NodeType(tele.mapId, pos, tele_pair.first, teleZoneId, lvlmin, lvlmax, tele.name);
-    }
-
-    for (decltype(WanderMap.Nodes)::value_type& mapNodes1 : WanderMap.Nodes)
-    {
-        for (decltype(mapNodes1.second)::iterator it = mapNodes1.second.begin(); it != mapNodes1.second.end();)
-        {
-            for (auto& nodepair2 : WanderMap.Nodes.at(it->second.m_mapId))
-            {
-                if (it->first == nodepair2.first)
-                    continue;
-
-                float dist2d = it->second.GetExactDist2d(nodepair2.second);
-                if (dist2d < NODE_CONNECTION_DIST_MAX_GEN)
-                    it->second.connections.push_back(&nodepair2.second);
-            }
-
-            if (it->second.connections.empty())
-                it = mapNodes1.second.erase(it);
-            else
-                ++it;
-        }
-    }
-
-    uint32 total_nodes = 0;
-    for (decltype(WanderMap.Nodes)::value_type& mapNodes1 : WanderMap.Nodes)
-        total_nodes += mapNodes1.second.size();
-
-    if (total_nodes == 0)
-    {
-        TC_LOG_FATAL("server.loading", "Failed to generate wander points: no game_tele points added!");
-        ASSERT(false);
-    }
-
-    TC_LOG_INFO("server.loading", "Generated %u nodes, saving...", total_nodes);
-
-    std::ostringstream ss;
-    ss.setf(std::ios_base::fixed);
-    ss.precision(4);
-    ss << "INSERT INTO creature_wander_nodes (id, mapid, zoneid, x, y, z, o, name) VALUES ";
-    for (auto const& vt : WanderMap.Nodes)
-    {
-        for (auto const& nvt : vt.second)
-        {
-            auto const& n = nvt.second;
-            ss << '('
-                << n.id << ',' << n.m_mapId << ',' << n.zoneId << ','
-                << n.m_positionX << ',' << n.m_positionY << ',' << n.m_positionZ << ',' << n.GetOrientation() << ','
-                << '\'' << n.name << '\''
-                << "),";
-        }
-    }
-
-    std::string qstring = ss.str();
-    qstring.resize(qstring.size() - 1);
-    //TC_LOG_INFO("scripts", "Executing: %s", qstring.c_str());
-
-    WorldDatabase.DirectExecute(qstring.c_str());
-
-    TC_LOG_INFO("server.loading", "Successfully exported %u nodes", total_nodes);
+    ItemTemplate const* proto1 = item1->GetTemplate();
+    ItemTemplate const* proto2 = item2->GetTemplate();
+    return proto1->Name1 < proto2->Name1;
 }
 
-void FillWanderMap()
+class BotBattlegroundEnterEvent : public BasicEvent
 {
-    using NodeType = BotTravelGraph::BotTravelNode;
+    const ObjectGuid _playerGUID;
+    const ObjectGuid _botGUID;
+    const BattlegroundQueueTypeId _bgQueueTypeId;
+    const uint64 _removeTime;
 
-    //TC_LOG_INFO("server.loading", "Loading bot wander map...");
+public:
+    BotBattlegroundEnterEvent(ObjectGuid playerGUID, ObjectGuid botGUID, BattlegroundQueueTypeId bgQueueTypeId, uint64 removeTime)
+        : _playerGUID(playerGUID), _botGUID(botGUID), _bgQueueTypeId(bgQueueTypeId), _removeTime(removeTime) {}
 
-    uint32 botoldMSTime = getMSTime();
-
-    WorldDatabase.DirectExecute(WanderMapCreationQuery);
-    QueryResult tableExists = WorldDatabase.Query("SELECT * from creature_wander_nodes LIMIT 1");
-    if (!tableExists)
+    void AbortMe()
     {
-        TC_LOG_WARN("server.loading", "Table `creature_wander_nodes` is empty. Trying to re-generate nodes... (this is a one-time action)");
-        GenerateWanderNodes();
+        TC_LOG_ERROR("npcbots", "BotBattlegroundEnterEvent: Aborting bot {} bg {}!", _botGUID.GetEntry(), uint32(_bgQueueTypeId));
+        sBattlegroundMgr->GetBattlegroundQueue(_bgQueueTypeId).RemovePlayer(_botGUID, true);
+        BotDataMgr::DespawnWandererBot(_botGUID.GetEntry());
     }
 
-    QueryResult wres = WorldDatabase.Query("SELECT id, mapid, zoneid, x, y, z, o, name FROM creature_wander_nodes");
-    if (!wres)
+    void AbortAll()
     {
-        TC_LOG_FATAL("server.loading", "Failed to load wander points: table `creature_wander_nodes` is empty!");
+        TC_LOG_ERROR("npcbots", "BotBattlegroundEnterEvent: Aborting ALL bots by {} bg {}!", _playerGUID.GetCounter(), uint32(_bgQueueTypeId));
+        AbortMe();
+        botBGJoinEvents.at(_playerGUID).KillAllEvents(false);
+    }
+
+    bool Execute(uint64 e_time, uint32 /*p_time*/) override
+    {
+        if (e_time >= _removeTime)
+        {
+            AbortMe();
+            return true;
+        }
+        else if (Creature const* bot = BotDataMgr::FindBot(_botGUID.GetEntry()))
+        {
+            Player const* bgPlayer = ObjectAccessor::FindConnectedPlayer(_playerGUID);
+            if (bgPlayer && bgPlayer->IsInWorld() && bgPlayer->InBattleground() && bgPlayer->GetMap()->IsBattlegroundOrArena())
+            {
+                Battleground* bg = ASSERT_NOTNULL(bgPlayer->GetBattleground());
+
+                //full, some players connected
+                if (bg->GetPlayersCountByTeam(ALLIANCE) + bg->GetPlayersCountByTeam(HORDE) >= bg->GetMaxPlayersPerTeam() * 2)
+                {
+                    AbortAll();
+                    return true;
+                }
+
+                BattlegroundQueue& queue = sBattlegroundMgr->GetBattlegroundQueue(_bgQueueTypeId);
+                if (!queue.IsBotInvited(_botGUID, bg->GetInstanceID()))
+                {
+                    AbortMe();
+                    return true;
+                }
+
+                queue.RemovePlayer(bot->GetGUID(), false);
+
+                //BG is set second time in Battleground::AddBot() but it's the same value so this is alright
+                bot->GetBotAI()->SetBG(bg);
+
+                TeamId teamId = BotDataMgr::GetTeamIdForFaction(bot->GetFaction());
+                BotMgr::TeleportBot(const_cast<Creature*>(bot), bgPlayer->GetMap(), bg->GetTeamStartPosition(teamId), true, false);
+            }
+            else if (bgPlayer && bgPlayer->InBattlegroundQueue() && bgPlayer->GetBattlegroundQueueIndex(_bgQueueTypeId) < PLAYER_MAX_BATTLEGROUND_QUEUES)
+                botBGJoinEvents.at(_playerGUID).AddEventAtOffset(new BotBattlegroundEnterEvent(_playerGUID, _botGUID, _bgQueueTypeId, _removeTime), 2s);
+            else
+                AbortAll();
+        }
+
+        return true;
+    }
+
+    void Abort(uint64 /*e_time*/) override { AbortMe(); }
+};
+
+void SpawnWandererBot(uint32 bot_id, WanderNode const* spawnLoc, NpcBotRegistry* registry)
+{
+    CreatureTemplate const& bot_template = _botsWanderCreatureTemplates.at(bot_id);
+    NpcBotData const* bot_data = BotDataMgr::SelectNpcBotData(bot_id);
+    NpcBotExtras const* bot_extras = BotDataMgr::SelectNpcBotExtras(bot_id);
+    Position spawnPos = spawnLoc->GetPosition();
+
+    ASSERT(bot_data);
+    ASSERT(bot_extras);
+
+    Map* map = sMapMgr->CreateBaseMap(spawnLoc->GetMapId());
+    map->LoadGrid(spawnLoc->m_positionX, spawnLoc->m_positionY);
+
+    TC_LOG_DEBUG("npcbots", "Spawning wandering bot: {} ({}) class {} race {} fac {}, location: mapId {} {} ({})",
+        bot_template.Name, bot_id, uint32(bot_extras->bclass), uint32(bot_extras->race), bot_data->faction,
+        spawnLoc->GetMapId(), spawnLoc->ToString(), spawnLoc->GetName());
+
+    Creature* bot = new Creature();
+    if (!bot->LoadBotCreatureFromDB(0, map, true, true, bot_id, &spawnPos))
+    {
+        delete bot;
+        TC_LOG_FATAL("server.loading", "Cannot load npcbot from DB!");
         ASSERT(false);
     }
 
-    do
+    if (registry)
+        registry->insert(bot);
+}
+
+void BotDataMgr::DespawnWandererBot(uint32 entry)
+{
+    Creature const* bot = FindBot(entry);
+    if (bot && bot->IsWandererBot())
     {
-        Field* fields = wres->Fetch();
-        uint32 index = 0;
+        if (bot->GetBotAI())
+            bot->GetBotAI()->canUpdate = false;
+        _botsWanderCreaturesToDespawn.insert(entry);
+    }
+    else
+        TC_LOG_ERROR("npcbots", "DespawnWandererBot(): trying to despawn non-existing wanderer bot {} '{}'!", entry, bot ? bot->GetName() : "unknown");
+}
 
-        uint32 id             = fields[  index].GetUInt32();
-        uint32 mapid          = fields[++index].GetUInt16();
+struct WanderingBotsGenerator
+{
+private:
+    using NodeVec = std::vector<WanderNode const*>;
 
-        if (std::find(std::cbegin(wanderMapIds), std::cend(wanderMapIds), mapid) == wanderMapIds.cend())
-            continue;
+    const std::map<uint8, uint32> wbot_faction_for_ex_class = {
+        {BOT_CLASS_BM, 14u/*2u*/},
+        {BOT_CLASS_SPHYNX, 14u},
+        {BOT_CLASS_ARCHMAGE, 14u/*1u*/},
+        {BOT_CLASS_DREADLORD, 14u},
+        {BOT_CLASS_SPELLBREAKER, 14u/*1610u*/},
+        {BOT_CLASS_DARK_RANGER, 14u},
+        {BOT_CLASS_NECROMANCER, 14u},
+        {BOT_CLASS_SEA_WITCH, 14u},
+        {BOT_CLASS_CRYPT_LORD, 14u}
+    };
 
-        uint32 zoneId         = fields[++index].GetUInt32();
+    uint32 next_bot_id;
+    uint32 enabledBotsCount;
 
-        auto [lvlmin, lvlmax] = BotDataMgr::GetZoneLevels(zoneId);
-        if (lvlmin == 0 || lvlmax == 0)
-            continue;
-
-        float x          = fields[++index].GetFloat();
-        float y          = fields[++index].GetFloat();
-        float z          = fields[++index].GetFloat();
-        float o          = fields[++index].GetFloat();
-        std::string name = fields[++index].GetString();
-
-        WanderMap.Nodes[mapid][id] = NodeType(mapid, x, y, z, o, id, zoneId, lvlmin, lvlmax, name);
-
-    } while (wres->NextRow());
-
-    uint32 total_connections = 0;
-    float mindist = 50000.f;
-    float maxdist = 0.f;
-    for (decltype(WanderMap.Nodes)::value_type& mapNodes1 : WanderMap.Nodes)
+    WanderingBotsGenerator()
     {
-        for (decltype(mapNodes1.second)::iterator it = mapNodes1.second.begin(); it != mapNodes1.second.end();)
+        next_bot_id = BOT_ENTRY_CREATE_BEGIN - 1;
+        QueryResult result = CharacterDatabase.PQuery("SELECT value FROM worldstates WHERE entry = {}", uint32(BOT_GIVER_ENTRY));
+        if (!result)
         {
-            for (auto& nodepair2 : WanderMap.Nodes.at(it->second.m_mapId))
+            TC_LOG_WARN("server.loading", "Next bot id for autogeneration is not found! Resetting! (client cache may interfere with names)");
+            for (uint32 bot_cid : BotDataMgr::GetExistingNPCBotIds())
+                if (bot_cid > next_bot_id)
+                    next_bot_id = bot_cid;
+            CharacterDatabase.DirectPExecute("INSERT INTO worldstates (entry, value, comment) VALUES ({}, {}, '{}')",
+                uint32(BOT_GIVER_ENTRY), next_bot_id, "NPCBOTS MOD - last autogenerated bot entry");
+        }
+        else
+            next_bot_id = result->Fetch()[0].GetUInt32();
+
+        ASSERT(next_bot_id > BOT_ENTRY_BEGIN);
+
+        for (uint8 c = BOT_CLASS_WARRIOR; c < BOT_CLASS_END; ++c)
+            if (BotMgr::IsClassEnabled(c) && _spareBotIdsPerClassMap.find(c) == _spareBotIdsPerClassMap.cend())
+                _spareBotIdsPerClassMap.insert({ c, {} });
+
+        for (decltype(_botsExtras)::value_type const& vt : _botsExtras)
+        {
+            uint8 c = vt.second->bclass;
+            if (c != BOT_CLASS_NONE && BotMgr::IsClassEnabled(c))
             {
-                if (it->first == nodepair2.first)
-                    continue;
-
-                float dist2d = it->second.GetExactDist2d(nodepair2.second);
-                if (dist2d < NODE_CONNECTION_DIST_MAX)
+                ++enabledBotsCount;
+                if (_botsData.find(vt.first) == _botsData.end())
                 {
-                    if (dist2d < mindist)
-                        mindist = dist2d;
-                    if (dist2d > maxdist)
-                        maxdist = dist2d;
-
-                    it->second.connections.push_back(&nodepair2.second);
-                    if (nodepair2.second.connections.empty() ||
-                        std::find(std::cbegin(nodepair2.second.connections), std::cend(nodepair2.second.connections), &it->second) == nodepair2.second.connections.cend())
-                        ++total_connections;
+                    ASSERT(_spareBotIdsPerClassMap.find(c) != _spareBotIdsPerClassMap.cend());
+                    _spareBotIdsPerClassMap.at(c).insert(vt.first);
                 }
             }
+        }
 
-            if (it->second.connections.empty())
-                it = mapNodes1.second.erase(it);
+        for (uint8 c = BOT_CLASS_WARRIOR; c < BOT_CLASS_END; ++c)
+            if (_spareBotIdsPerClassMap.find(c) != _spareBotIdsPerClassMap.cend() && _spareBotIdsPerClassMap.at(c).empty())
+                _spareBotIdsPerClassMap.erase(c);
+    }
+
+    uint32 GetDefaultFactionForRaceClass(uint8 bot_class, uint8 bot_race) const
+    {
+        ChrRacesEntry const* rentry = sChrRacesStore.LookupEntry(bot_race);
+        return (bot_class >= BOT_CLASS_EX_START) ? wbot_faction_for_ex_class.find(bot_class)->second : rentry ? rentry->FactionID : 14u;
+    }
+
+    bool GenerateWanderingBotToSpawn(std::map<uint8, std::set<uint32>>& spareBotIdsPerClass, uint8 desired_bracket,
+        NodeVec const& spawns_a, NodeVec const& spawns_h, NodeVec const& spawns_n,
+        bool immediate, PvPDifficultyEntry const* bracketEntry, NpcBotRegistry* registry)
+    {
+        ASSERT(!spareBotIdsPerClass.empty());
+
+        CreatureTemplateContainer const& all_templates = sObjectMgr->GetCreatureTemplates();
+
+        while (all_templates.find(++next_bot_id) != all_templates.cend()) {}
+
+        auto const& spareBotPair = Trinity::Containers::SelectRandomContainerElement(spareBotIdsPerClass);
+        const uint8 bot_class = spareBotPair.first;
+        auto const& cSet = spareBotPair.second;
+        ASSERT(!cSet.empty());
+        uint32 orig_entry = cSet.size() == 1 ? *cSet.cbegin() : Trinity::Containers::SelectRandomContainerElement(cSet);
+        CreatureTemplate const* orig_template = ASSERT_NOTNULL(sObjectMgr->GetCreatureTemplate(orig_entry));
+        NpcBotExtras const* orig_extras = ASSERT_NOTNULL(BotDataMgr::SelectNpcBotExtras(orig_entry));
+        uint32 bot_faction = GetDefaultFactionForRaceClass(bot_class, orig_extras->race);
+
+        NodeVec const* bot_spawn_nodes;
+        TeamId bot_team = BotDataMgr::GetTeamIdForFaction(bot_faction);
+        switch (bot_team)
+        {
+            case TEAM_ALLIANCE:
+                bot_spawn_nodes = &spawns_a;
+                break;
+            case TEAM_HORDE:
+                bot_spawn_nodes = &spawns_h;
+                break;
+            default:
+                bot_spawn_nodes = &spawns_n;
+                break;
+        }
+        NodeVec level_nodes;
+        level_nodes.reserve(bot_spawn_nodes->size());
+        desired_bracket = std::max<uint8>(desired_bracket, BotDataMgr::GetMinLevelForBotClass(bot_class) / 10);
+        for (WanderNode const* node : *bot_spawn_nodes)
+        {
+            if (desired_bracket * 10 + 9 >= node->GetLevels().first && node->GetLevels().second >= desired_bracket * 10)
+                level_nodes.push_back(node);
+        }
+
+        ASSERT(!level_nodes.empty());
+        WanderNode const* spawnLoc = Trinity::Containers::SelectRandomContainerElement(level_nodes);
+
+        CreatureTemplate& bot_template = _botsWanderCreatureTemplates[next_bot_id];
+        //copy all fields
+        bot_template = *orig_template;
+        bot_template.Entry = next_bot_id;
+        bot_template.Title = "";
+        bot_template.speed_run = BotMgr::GetBotWandererSpeedMod();
+        bot_template.KillCredit[0] = orig_entry;
+        //bot_template.type_flags |= CREATURE_TYPE_FLAG_FORCE_GOSSIP;
+
+        uint32 max_level = DEFAULT_MAX_LEVEL;
+        if (bracketEntry && BotMgr::IsBotLevelCappedByConfigBG())
+        {
+            max_level = std::min<uint32>(sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL), max_level);
+            max_level = std::min<uint32>(GetMaxLevelForExpansion(sWorld->getIntConfig(CONFIG_EXPANSION)), max_level);
+        }
+
+        if (bracketEntry)
+        {
+            //force level range for bgs
+            bot_template.minlevel = std::min<uint32>(bracketEntry->MinLevel, max_level);
+            bot_template.maxlevel = std::min<uint32>(bracketEntry->MaxLevel, max_level);
+        }
+        else
+        {
+            bot_template.minlevel = std::min<uint32>(std::max<uint32>(desired_bracket * 10, spawnLoc->GetLevels().first), max_level);
+            bot_template.maxlevel = std::min<uint32>(std::min<uint32>(desired_bracket * 10 + 9, spawnLoc->GetLevels().second), max_level);
+            bot_template.flags_extra &= ~(CREATURE_FLAG_EXTRA_NO_XP);
+        }
+
+        bot_template.InitializeQueryData();
+
+        uint8 bot_spec = bot_ai::SelectSpecForClass(bot_class);
+        NpcBotData* bot_data = new NpcBotData(bot_ai::DefaultRolesForClass(bot_class, bot_spec), bot_faction, bot_spec);
+        _botsData[next_bot_id] = bot_data;
+        NpcBotExtras* bot_extras = new NpcBotExtras();
+        bot_extras->bclass = bot_class;
+        bot_extras->race = orig_extras->race;
+        _botsExtras[next_bot_id] = bot_extras;
+        if (NpcBotAppearanceData const* orig_apdata = BotDataMgr::SelectNpcBotAppearance(orig_entry))
+        {
+            NpcBotAppearanceData* bot_apdata = new NpcBotAppearanceData();
+            bot_apdata->face = orig_apdata->face;
+            bot_apdata->features = orig_apdata->features;
+            bot_apdata->gender = orig_apdata->gender;
+            bot_apdata->hair = orig_apdata->hair;
+            bot_apdata->haircolor = orig_apdata->haircolor;
+            bot_apdata->skin = orig_apdata->skin;
+            _botsAppearanceData[next_bot_id] = bot_apdata;
+        }
+        int8 beqId = 1;
+        _botsWanderCreatureEquipmentTemplates[next_bot_id] = sObjectMgr->GetEquipmentInfo(orig_entry, beqId);
+
+        //We do not create CreatureData for generated bots
+
+        CellCoord c = Trinity::ComputeCellCoord(spawnLoc->m_positionX, spawnLoc->m_positionY);
+        GridCoord g = Trinity::ComputeGridCoord(spawnLoc->m_positionX, spawnLoc->m_positionY);
+        ASSERT(c.IsCoordValid(), "Invalid Cell coord!");
+        ASSERT(g.IsCoordValid(), "Invalid Grid coord!");
+        Map* map = sMapMgr->CreateBaseMap(spawnLoc->GetMapId());
+        ASSERT(map->GetEntry()->IsContinent() || map->GetEntry()->IsBattlegroundOrArena(), "%s", map->GetDebugInfo().c_str());
+
+        if (immediate)
+            SpawnWandererBot(next_bot_id, spawnLoc, registry);
+        else
+            _botsWanderCreaturesToSpawn.push_back({ next_bot_id, spawnLoc });
+
+        _spareBotIdsPerClassMap.at(bot_class).erase(orig_entry);
+        if (_spareBotIdsPerClassMap.at(bot_class).empty())
+            _spareBotIdsPerClassMap.erase(bot_class);
+
+        spareBotIdsPerClass.at(bot_class).erase(orig_entry);
+        if (spareBotIdsPerClass.at(bot_class).empty())
+            spareBotIdsPerClass.erase(bot_class);
+
+        return true;
+    }
+
+public:
+    uint32 GetEnabledBotsCount() const { return enabledBotsCount; }
+
+    uint32 GetSpareBotsCount(TeamId teamId = TEAM_NEUTRAL) const
+    {
+        uint32 count = 0;
+        for (auto const& kv : _spareBotIdsPerClassMap)
+        {
+            if (teamId == TEAM_NEUTRAL)
+                count += kv.second.size();
             else
             {
-                if (it->second.connections.size() == 1u)
+                if (kv.first >= BOT_CLASS_EX_START)
                 {
-                    WanderMap.Tops.push_back(&it->second);
-                    if (it->second.connections.front()->connections.size() == 1)
-                        TC_LOG_INFO("server.loading", "Node pair %u-%u is isolated!", it->second.id, it->second.connections.front()->id);
+                    auto cit = wbot_faction_for_ex_class.find(kv.first);
+                    if (cit != wbot_faction_for_ex_class.cend() && cit->second == FACTION_MONSTER)
+                        continue;
                 }
-                ++it;
+
+                for (uint32 entry : kv.second)
+                {
+                    NpcBotExtras const* extras = ASSERT_NOTNULL(BotDataMgr::SelectNpcBotExtras(entry));
+                    uint32 bot_faction = GetDefaultFactionForRaceClass(kv.first, extras->race);
+                    TeamId bot_team = BotDataMgr::GetTeamIdForFaction(bot_faction);
+                    if (teamId == bot_team)
+                        ++count;
+                }
             }
         }
+        return count;
     }
 
-    uint32 total_nodes = 0;
-    for (auto const& vt : WanderMap.Nodes)
+    bool GenerateWanderingBotsToSpawn(uint32 count, int32 map_id, int32 team, bool immediate, PvPDifficultyEntry const* bracketEntry, NpcBotRegistry* registry, uint32& spawned)
     {
-        total_nodes += vt.second.size();
-        if (vt.second.empty())
+        using NodeVec = std::vector<WanderNode const*>;
+
+        if (_spareBotIdsPerClassMap.empty())
+            return false;
+
+        NodeVec spawns_a, spawns_h, spawns_n;
+        for (NodeVec* vec : { &spawns_a, &spawns_h, &spawns_n })
+            vec->reserve(WanderNode::GetWPMapsCount() * 20u);
+
+        WanderNode::DoForAllWPs([map_id = map_id, &spawns_a, &spawns_h, &spawns_n](WanderNode const* wp) {
+            MapEntry const* mapEntry = sMapStore.LookupEntry(wp->GetMapId());
+            if ((map_id == -1) ? mapEntry->IsWorldMap() : (int32(mapEntry->ID) == map_id))
+            {
+                if (wp->HasFlag(BotWPFlags::BOTWP_FLAG_SPAWN))
+                {
+                    if (wp->HasFlag(BotWPFlags::BOTWP_FLAG_ALLIANCE_ONLY))
+                        spawns_a.push_back(wp);
+                    else if (wp->HasFlag(BotWPFlags::BOTWP_FLAG_HORDE_ONLY))
+                        spawns_h.push_back(wp);
+                    else
+                    {
+                        spawns_a.push_back(wp);
+                        spawns_h.push_back(wp);
+                        spawns_n.push_back(wp);
+                    }
+                }
+            }
+        });
+
+        bool found_maxlevel_node_a = false;
+        bool found_maxlevel_node_h = false;
+        bool found_maxlevel_node_n = false;
+        const uint8 maxof_minclasslvl_nor = BotDataMgr::GetMinLevelForBotClass(BOT_CLASS_DEATH_KNIGHT); // 55
+        const uint8 maxof_minclasslvl_ex = BotDataMgr::GetMinLevelForBotClass(BOT_CLASS_DREADLORD); // 60
+        for (WanderNode const* wp : spawns_a)
         {
-            TC_LOG_FATAL("server.loading", "Failed to load wander points: no game_tele points added to map %u!", vt.first);
-            ASSERT(false);
+            if (wp->GetLevels().second >= maxof_minclasslvl_nor)
+            {
+                found_maxlevel_node_a = true;
+                break;
+            }
+        }
+        for (WanderNode const* wp : spawns_h)
+        {
+            if (wp->GetLevels().second >= maxof_minclasslvl_nor)
+            {
+                found_maxlevel_node_h = true;
+                break;
+            }
+        }
+        for (WanderNode const* wp : spawns_n)
+        {
+            if (wp->GetLevels().second >= maxof_minclasslvl_ex)
+            {
+                found_maxlevel_node_n = true;
+                break;
+            }
+        }
+
+        decltype (_spareBotIdsPerClassMap) teamSpareBotIdsPerClass;
+        BotBrackets bracketPcts{};
+        BotBrackets bots_per_bracket{};
+
+        if (team == -1)
+        {
+            if (!found_maxlevel_node_a || !found_maxlevel_node_h || !found_maxlevel_node_n)
+                return false;
+
+            //make a full copy
+            teamSpareBotIdsPerClass = _spareBotIdsPerClassMap;
+            bracketPcts = BotMgr::GetBotWandererLevelBrackets();
+        }
+        else
+        {
+            bracketPcts[bracketEntry->MinLevel / 10] = 100u;
+            switch (team)
+            {
+                case ALLIANCE:
+                    if (!found_maxlevel_node_a)
+                        return false;
+                    break;
+                case HORDE:
+                    if (!found_maxlevel_node_h)
+                        return false;
+                    break;
+                case TEAM_OTHER:
+                default:
+                    if (!found_maxlevel_node_n)
+                        return false;
+                    break;
+            }
+
+            for (auto const& kv : _spareBotIdsPerClassMap)
+            {
+                for (uint32 spareBotId : kv.second)
+                {
+                    NpcBotExtras const* orig_extras = ASSERT_NOTNULL(BotDataMgr::SelectNpcBotExtras(spareBotId));
+                    uint32 bot_faction = GetDefaultFactionForRaceClass(kv.first, orig_extras->race);
+                    uint32 botTeam = BotDataMgr::GetTeamForFaction(bot_faction);
+
+                    if (int32(botTeam) != team)
+                        continue;
+
+                    if (bracketEntry)
+                    {
+                        uint8 botminlevel = BotDataMgr::GetMinLevelForBotClass(kv.first);
+                        if (botminlevel > bracketEntry->MaxLevel)
+                            continue;
+                    }
+
+                    teamSpareBotIdsPerClass[kv.first].insert(spareBotId);
+                }
+            }
+        }
+
+        if (teamSpareBotIdsPerClass.empty())
+            return false;
+
+        uint32 total_bots_in_brackets = 0;
+        for (size_t k = 0; k < BracketsCount; ++k)
+        {
+            if (!bracketPcts[k])
+                continue;
+            bots_per_bracket[k] = CalculatePct(count, bracketPcts[k]);
+            total_bots_in_brackets += bots_per_bracket[k];
+        }
+        for (int32 j = BracketsCount - 1; j >= 0; --j)
+        {
+            if (bots_per_bracket[j])
+            {
+                bots_per_bracket[j] += count - total_bots_in_brackets;
+                break;
+            }
+        }
+
+        std::vector<uint8> brackets_shuffled;
+        brackets_shuffled.reserve(count);
+        for (uint8 bracket = 0; bracket < BracketsCount; ++bracket)
+        {
+            while (bots_per_bracket[bracket])
+            {
+                brackets_shuffled.push_back(bracket);
+                --bots_per_bracket[bracket];
+            }
+        }
+        Trinity::Containers::RandomShuffle(brackets_shuffled);
+
+        for (size_t i = 0; i < brackets_shuffled.size() && !teamSpareBotIdsPerClass.empty();) // i is a counter, NOT used as index or value
+        {
+            uint8 bracket = brackets_shuffled[i];
+
+            int8 tries = 100;
+            do {
+                --tries;
+                if (GenerateWanderingBotToSpawn(teamSpareBotIdsPerClass, bracket, spawns_a, spawns_h, spawns_n, immediate, bracketEntry, registry))
+                {
+                    ++i;
+                    ++spawned;
+                    break;
+                }
+            } while (tries >= 0);
+
+            if (tries < 0)
+                return false;
+        }
+
+        CharacterDatabase.PExecute("UPDATE worldstates SET value = {} WHERE entry = {}", next_bot_id, uint32(BOT_GIVER_ENTRY));
+
+        return true;
+    }
+
+    static WanderingBotsGenerator* instance()
+    {
+        static WanderingBotsGenerator _instance;
+        return &_instance;
+    }
+};
+#define sBotGen WanderingBotsGenerator::instance()
+
+void BotDataMgr::Update(uint32 diff)
+{
+    botSpawnEvents.Update(diff);
+    for (auto& kv : botBGJoinEvents)
+        kv.second.Update(diff);
+
+    if (!_botsWanderCreaturesToDespawn.empty())
+    {
+        TC_LOG_DEBUG("npcbots", "Bots to despawn: {}", uint32(_botsWanderCreaturesToDespawn.size()));
+
+        while (!_botsWanderCreaturesToDespawn.empty())
+        {
+            uint32 bot_despawn_id = *_botsWanderCreaturesToDespawn.begin();
+
+            Creature* bot = const_cast<Creature*>(FindBot(bot_despawn_id));
+            ASSERT(bot);
+
+            if (!bot->IsInWorld())
+                break;
+
+            _botsWanderCreaturesToDespawn.erase(bot_despawn_id);
+
+            uint32 origEntry = _botsWanderCreatureTemplates.at(bot_despawn_id).KillCredit[0];
+            std::string botName = bot->GetName();
+
+            _spareBotIdsPerClassMap[bot->GetBotClass()].insert(origEntry);
+
+            BotMgr::CleanupsBeforeBotDelete(bot);
+            bot->GetBotAI()->canUpdate = false;
+            bot->GetMap()->AddObjectToRemoveList(bot);
+
+            auto bditr = _botsData.find(bot_despawn_id);
+            auto beitr = _botsExtras.find(bot_despawn_id);
+            auto baditr = _botsAppearanceData.find(bot_despawn_id);
+            auto bwcetitr = _botsWanderCreatureEquipmentTemplates.find(bot_despawn_id);
+            auto bwctitr = _botsWanderCreatureTemplates.find(bot_despawn_id);
+
+            ASSERT(bditr != _botsData.end());
+            ASSERT(beitr != _botsExtras.end());
+            //ASSERT(baditr != _botsAppearanceData.end()); may not exist
+            ASSERT(bwcetitr != _botsWanderCreatureEquipmentTemplates.end());
+            ASSERT(bwctitr != _botsWanderCreatureTemplates.end());
+
+            delete bditr->second;
+            _botsData.erase(bditr);
+            delete beitr->second;
+            _botsExtras.erase(beitr);
+            if (baditr != _botsAppearanceData.end())
+            {
+                delete baditr->second;
+                _botsAppearanceData.erase(baditr);
+            }
+            _botsWanderCreatureEquipmentTemplates.erase(bwcetitr);
+            _botsWanderCreatureTemplates.erase(bwctitr);
+
+            TC_LOG_DEBUG("npcbots", "Despawned wanderer bot {} '{}' (orig {})", bot_despawn_id, botName, origEntry);
         }
     }
 
-    TC_LOG_INFO("server.loading", ">> Loaded %u bot wander nodes on %u maps (total %u ribs, %u tops) in %u ms",
-        total_nodes, uint32(WanderMap.Nodes.size()), total_connections, uint32(WanderMap.Tops.size()), GetMSTimeDiffToNow(botoldMSTime));
-    TC_LOG_INFO("server.loading", "Nodes distances: min = %.3f, max = %.3f", mindist, maxdist);
+    if (!_botsWanderCreaturesToSpawn.empty())
+    {
+        static const uint32 WANDERING_BOT_SPAWN_DELAY = 500;
+
+        next_wandering_bot_spawn_delay += diff;
+
+        while (next_wandering_bot_spawn_delay >= WANDERING_BOT_SPAWN_DELAY && !_botsWanderCreaturesToSpawn.empty())
+        {
+            next_wandering_bot_spawn_delay -= WANDERING_BOT_SPAWN_DELAY;
+
+            auto const& p = _botsWanderCreaturesToSpawn.front();
+
+            uint32 bot_id = p.first;
+            WanderNode const* spawnLoc = p.second;
+
+            _botsWanderCreaturesToSpawn.pop_front();
+
+            SpawnWandererBot(bot_id, spawnLoc, nullptr);
+        }
+
+        return;
+    }
 }
 
 std::shared_mutex* BotDataMgr::GetLock()
@@ -308,6 +703,12 @@ void BotDataMgr::LoadNpcBots(bool spawn)
             index = 0;
             uint32 entry = field[  index].GetUInt32();
 
+            if (!sObjectMgr->GetCreatureTemplate(entry))
+            {
+                TC_LOG_ERROR("server.loading", "Bot entry {} has appearance data but doesn't exist in `creature_template` table! Skipped.", entry);
+                continue;
+            }
+
             NpcBotAppearanceData* appearanceData = new NpcBotAppearanceData();
             appearanceData->gender =    field[++index].GetUInt8();
             appearanceData->skin =      field[++index].GetUInt8();
@@ -335,6 +736,12 @@ void BotDataMgr::LoadNpcBots(bool spawn)
             index = 0;
             uint32 entry =      field[  index].GetUInt32();
 
+            if (!sObjectMgr->GetCreatureTemplate(entry))
+            {
+                TC_LOG_ERROR("server.loading", "Bot entry {} has extras data but doesn't exist in `creature_template` table! Skipped.", entry);
+                continue;
+            }
+
             NpcBotExtras* extras = new NpcBotExtras();
             extras->bclass =    field[++index].GetUInt8();
             extras->race =      field[++index].GetUInt8();
@@ -358,13 +765,19 @@ void BotDataMgr::LoadNpcBots(bool spawn)
             index = 0;
             uint32 entry =          field[  index].GetUInt32();
 
+            if (!sObjectMgr->GetCreatureTemplate(entry))
+            {
+                TC_LOG_ERROR("server.loading", "Bot entry {} has transmog data but doesn't exist in `creature_template` table! Skipped.", entry);
+                continue;
+            }
+
             if (_botsTransmogData.count(entry) == 0)
                 _botsTransmogData[entry] = new NpcBotTransmogData();
 
             //load data
             uint8 slot =            field[++index].GetUInt8();
             uint32 item_id =        field[++index].GetUInt32();
-            uint32 fake_id =        field[++index].GetUInt32();
+            int32 fake_id =         field[++index].GetInt32();
 
             _botsTransmogData[entry]->transmogs[slot] = { item_id, fake_id };
 
@@ -396,6 +809,12 @@ void BotDataMgr::LoadNpcBots(bool spawn)
             index = 0;
             uint32 entry =          field[  index].GetUInt32();
 
+            if (!sObjectMgr->GetCreatureTemplate(entry))
+            {
+                TC_LOG_ERROR("server.loading", "Bot entry {} doesn't exist in `creature_template` table! Skipped.", entry);
+                continue;
+            }
+
             //load data
             botData = new NpcBotData(0, 0);
             botData->owner =        field[++index].GetUInt32();
@@ -419,7 +838,7 @@ void BotDataMgr::LoadNpcBots(bool spawn)
 
         } while (result->NextRow());
 
-        TC_LOG_INFO("server.loading", ">> Loaded %u bot data entries", datacounter);
+        TC_LOG_INFO("server.loading", ">> Loaded {} bot data entries", datacounter);
 
         if (spawn)
         {
@@ -427,16 +846,11 @@ void BotDataMgr::LoadNpcBots(bool spawn)
             {
                 uint32 entry = *itr;
                 proto = sObjectMgr->GetCreatureTemplate(entry);
-                if (!proto)
-                {
-                    TC_LOG_ERROR("server.loading", "Cannot find creature_template entry for npcbot (id: %u)!", entry);
-                    continue;
-                }
                 //                                     1     2    3           4            5           6
-                infores = WorldDatabase.PQuery("SELECT guid, map, position_x, position_y"/*, position_z, orientation*/" FROM creature WHERE id = %u", entry);
+                infores = WorldDatabase.PQuery("SELECT guid, map, position_x, position_y"/*, position_z, orientation*/" FROM creature WHERE id = {}", entry);
                 if (!infores)
                 {
-                    TC_LOG_ERROR("server.loading", "Cannot spawn npcbot %s (id: %u), not found in `creature` table!", proto->Name.c_str(), entry);
+                    TC_LOG_ERROR("server.loading", "Cannot spawn npcbot {} (id: {}), not found in `creature` table!", proto->Name, entry);
                     continue;
                 }
 
@@ -456,50 +870,48 @@ void BotDataMgr::LoadNpcBots(bool spawn)
                 map->LoadGrid(pos_x, pos_y);
 
                 ObjectGuid Guid(HighGuid::Unit, entry, tableGuid);
-                TC_LOG_DEBUG("server.loading", "bot %u: spawnId %u, full %s", entry, tableGuid, Guid.ToString().c_str());
+                TC_LOG_DEBUG("server.loading", "bot {}: spawnId {}, full {}", entry, tableGuid, Guid.ToString());
                 Creature* bot = map->GetCreature(Guid);
                 if (!bot) //not in map, use storage
                 {
-                    //TC_LOG_DEBUG("server.loading", "bot %u: spawnId %u, is not in map on load", entry, tableGuid);
+                    //TC_LOG_DEBUG("server.loading", "bot {}: spawnId {}, is not in map on load", entry, tableGuid);
                     typedef Map::CreatureBySpawnIdContainer::const_iterator SpawnIter;
                     std::pair<SpawnIter, SpawnIter> creBounds = map->GetCreatureBySpawnIdStore().equal_range(tableGuid);
                     if (creBounds.first == creBounds.second)
                     {
-                        TC_LOG_ERROR("server.loading", "bot %u is not in spawns list, consider re-spawning it!", entry);
+                        TC_LOG_ERROR("server.loading", "bot {} is not in spawns list, consider re-spawning it!", entry);
                         continue;
                     }
                     bot = creBounds.first->second;
                 }
                 ASSERT(bot);
                 if (!bot->FindMap())
-                    TC_LOG_ERROR("server.loading", "bot %u is not in map!", entry);
+                    TC_LOG_ERROR("server.loading", "bot {} is not in map!", entry);
                 if (!bot->IsInWorld())
-                    TC_LOG_ERROR("server.loading", "bot %u is not in world!", entry);
+                    TC_LOG_ERROR("server.loading", "bot {} is not in world!", entry);
                 if (!bot->IsAlive())
                 {
-                    TC_LOG_ERROR("server.loading", "bot %u is dead, respawning!", entry);
+                    TC_LOG_ERROR("server.loading", "bot {} is dead, respawning!", entry);
                     bot->Respawn();
                 }
 
-                TC_LOG_DEBUG("server.loading", ">> Spawned npcbot %s (id: %u, map: %u, grid: %u, cell: %u)", proto->Name.c_str(), entry, mapId, g.GetId(), c.GetId());
+                TC_LOG_DEBUG("server.loading", ">> Spawned npcbot {} (id: {}, map: {}, grid: {}, cell: {})", proto->Name, entry, mapId, g.GetId(), c.GetId());
                 botgrids.insert(g.GetId());
                 ++botcounter;
             }
 
-            TC_LOG_INFO("server.loading", ">> Spawned %u npcbot(s) within %u grid(s) in %u ms", botcounter, uint32(botgrids.size()), GetMSTimeDiffToNow(botoldMSTime));
+            TC_LOG_INFO("server.loading", ">> Spawned {} npcbot(s) within {} grid(s) in {} ms", botcounter, uint32(botgrids.size()), GetMSTimeDiffToNow(botoldMSTime));
         }
     }
     else
         TC_LOG_INFO("server.loading", ">> Loaded 0 npcbots. Table `characters_npcbot` is empty!");
 
     allBotsLoaded = true;
-
-    GenerateWanderingBots();
 }
 
 void BotDataMgr::LoadNpcBotGroupData()
 {
-    TC_LOG_INFO("server.loading", "Loading NPCBot Group members...");
+    TC_LOG_INFO("server.loading", "Loading NPCBot group members...");
 
     uint32 oldMSTime = getMSTime();
 
@@ -520,204 +932,1310 @@ void BotDataMgr::LoadNpcBotGroupData()
         Field* fields = result->Fetch();
 
         uint32 creature_id = fields[1].GetUInt32();
+        uint8 subgroup = fields[3].GetUInt8();
         if (!SelectNpcBotExtras(creature_id))
         {
-            TC_LOG_WARN("server.loading", "Table `characters_npcbot_group_member` contains non-NPCBot creature %u which will not be loaded!", creature_id);
+            TC_LOG_WARN("server.loading", "Table `characters_npcbot_group_member` contains non-NPCBot creature {} which will not be loaded!", creature_id);
             continue;
         }
 
         if (Group* group = sGroupMgr->GetGroupByDbStoreId(fields[0].GetUInt32()))
-            group->LoadCreatureMemberFromDB(creature_id, fields[2].GetUInt8(), fields[3].GetUInt8(), fields[4].GetUInt8());
+        {
+            group->LoadCreatureMemberFromDB(creature_id, fields[2].GetUInt8(), subgroup, fields[4].GetUInt8());
+            const_cast<Creature*>(ASSERT_NOTNULL(BotDataMgr::FindBot(creature_id)))->SetBotGroup(group, subgroup);
+        }
         else
-            TC_LOG_ERROR("misc", "BotDataMgr::LoadNpcBotGroupData: Consistency failed, can't find group (storage id: %u)", fields[0].GetUInt32());
+            TC_LOG_ERROR("misc", "BotDataMgr::LoadNpcBotGroupData: Consistency failed, can't find group (storage id: {})", fields[0].GetUInt32());
 
         ++count;
 
     } while (result->NextRow());
 
-    TC_LOG_INFO("server.loading", ">> Loaded %u NPCBot group members in %u ms", count, GetMSTimeDiffToNow(oldMSTime));
+    TC_LOG_INFO("server.loading", ">> Loaded {} NPCBot group members in {} ms", count, GetMSTimeDiffToNow(oldMSTime));
+}
+
+void BotDataMgr::LoadNpcBotGearStorage()
+{
+    TC_LOG_INFO("server.loading", "Loading NPCBot items storage...");
+
+    uint32 oldMSTime = getMSTime();
+
+    QueryResult result = CharacterDatabase.Query(
+    //          0               1                   2         3            4           5         6                7                    8              9              10       11       12            13             14       15
+        "SELECT ii.creatorGuid, ii.giftCreatorGuid, ii.count, ii.duration, ii.charges, ii.flags, ii.enchantments, ii.randomPropertyId, ii.durability, ii.playedTime, ii.text, ii.guid, ii.itemEntry, ii.owner_guid, gs.guid, gs.item_guid"
+        " FROM  characters_npcbot_gear_storage gs JOIN item_instance ii ON gs.item_guid = ii.guid ORDER BY gs.guid, gs.item_guid");
+    if (!result)
+    {
+        TC_LOG_INFO("server.loading", ">> Loaded 0 NPCBot stored gear items. DB table `characters_npcbot_gear_storage` is empty!");
+        return;
+    }
+
+    uint32 count = 0;
+    std::set<uint32> player_guids;
+    do
+    {
+        Field* fields = result->Fetch();
+
+        uint32 item_id = fields[12].GetUInt32();
+        uint32 player_guidlow = fields[14].GetUInt32();
+        uint32 item_guidlow = fields[15].GetUInt32();
+
+        Item* item = new Item();
+        ObjectGuid player_guid = ObjectGuid::Create<HighGuid::Player>(player_guidlow);
+        ASSERT(item->LoadFromDB(item_guidlow, player_guid, fields, item_id), "LoadNpcBotGearStorage(): unable to load item %u id %u! Owner: %s", item_guidlow, item_id, player_guid.ToString().c_str());
+
+        _botStoredGearMap[player_guid].insert(item);
+        player_guids.insert(player_guidlow);
+        ++count;
+
+    } while (result->NextRow());
+
+    TC_LOG_INFO("server.loading", ">> Loaded {} NPCBot stored items for {} bot owners in {} ms", count, uint32(player_guids.size()), GetMSTimeDiffToNow(oldMSTime));
+}
+
+void BotDataMgr::LoadWanderMap(bool reload)
+{
+    using SpawnMapEx = std::map<uint32, bool>;
+    using SpawnVector = std::vector<WanderNode const*>;
+
+    const std::array<uint32, 4> ALL_CONTINENT_MAPS = { 0u, 1u, 530, 571 };
+
+    if (WanderNode::GetAllWPsCount() > 0u)
+    {
+        if (!reload)
+            return;
+
+        WanderNode::RemoveAllWPs();
+    }
+
+    _wpMinSpawnLevelPerMapId.clear();
+    _wpMaxSpawnLevelPerMapId.clear();
+
+    uint32 botoldMSTime = getMSTime();
+
+    TC_LOG_INFO("server.loading", "Setting up wander map...");
+
+    //                                             0    1   2 3 4 5   6      7       8        9      10   11    12
+    QueryResult wres = WorldDatabase.Query("SELECT id,mapid,x,y,z,o,zoneId,areaId,minlevel,maxlevel,flags,name,links FROM creature_template_npcbot_wander_nodes ORDER BY mapid,id");
+    if (!wres)
+    {
+        TC_LOG_FATAL("server.loading", "Failed to load wander points: table `creature_template_npcbot_wander_nodes` is empty!");
+        ASSERT(false);
+    }
+
+    const uint32 maxof_minclasslvl_nr = GetMinLevelForBotClass(BOT_CLASS_DEATH_KNIGHT); // 55
+    const uint32 maxof_minclasslvl_ex = GetMinLevelForBotClass(BOT_CLASS_DREADLORD); // 60
+    SpawnVector all_spawn_nodes;
+    SpawnMapEx spawn_node_exists_a;
+    SpawnMapEx spawn_node_exists_h;
+    SpawnMapEx spawn_node_exists_n;
+    std::unordered_map<uint32, std::pair<WanderNode*, std::vector<std::pair<std::string, std::string>>>> links_to_create;
+
+    all_spawn_nodes.reserve(wres->GetRowCount() >> 8);
+    for (SpawnMapEx* smap : { &spawn_node_exists_a, &spawn_node_exists_h, &spawn_node_exists_n })
+        for (uint32 mapId : ALL_CONTINENT_MAPS)
+            if (BotMgr::IsBotGenerationEnabledWorldMapId(mapId))
+                smap->emplace(mapId, false);
+
+    uint32 disabled_nodes = 0;
+    do
+    {
+        Field* fields = wres->Fetch();
+        uint32 index = 0;
+
+        uint32 id             = fields[  index].GetUInt32();
+        uint32 mapId          = fields[++index].GetUInt16();
+        float x               = fields[++index].GetFloat();
+        float y               = fields[++index].GetFloat();
+        float z               = fields[++index].GetFloat();
+        float o               = fields[++index].GetFloat();
+        uint32 zoneId         = fields[++index].GetUInt32();
+        uint32 areaId         = fields[++index].GetUInt32();
+        uint8 minLevel        = fields[++index].GetUInt8();
+        uint8 maxLevel        = fields[++index].GetUInt8();
+        uint32 flags          = fields[++index].GetUInt32();
+        std::string name      = fields[++index].GetString();
+        std::string_view lstr = fields[++index].GetStringView();
+
+        WanderNode::nextWPId = std::max<uint32>(WanderNode::nextWPId, id);
+
+        MapEntry const* mapEntry = sMapStore.LookupEntry(mapId);
+        if (!mapEntry)
+        {
+            TC_LOG_ERROR("server.loading", "WP {} has invalid map id {}!", id, mapId);
+            continue;
+        }
+
+        if (minLevel == 1u && maxLevel == DEFAULT_MAX_LEVEL)
+            TC_LOG_WARN("server.loading", "WP {} has no levels set.", id);
+
+        if (!minLevel || !maxLevel || minLevel > DEFAULT_MAX_LEVEL || maxLevel > DEFAULT_MAX_LEVEL || minLevel > maxLevel)
+        {
+            TC_LOG_WARN("server.loading", "WP {} has invalid levels min {} max {}! Setting to default...",
+                id, uint32(minLevel), uint32(maxLevel));
+            minLevel = 1;
+            maxLevel = DEFAULT_MAX_LEVEL;
+        }
+
+        if (flags >= AsUnderlyingType(BotWPFlags::BOTWP_FLAG_END))
+        {
+            TC_LOG_WARN("server.loading", "WP {} has invalid flags {}! Removing all invalid flags...", id, flags);
+            flags &= (AsUnderlyingType(BotWPFlags::BOTWP_FLAG_END) - 1);
+        }
+
+        const uint32 nonbg_flags = AsUnderlyingType(BotWPFlags::BOTWP_FLAG_BG_FLAG_PICKUP_TARGET) | AsUnderlyingType(BotWPFlags::BOTWP_FLAG_BG_FLAG_DELIVER_TARGET);
+        if ((flags & nonbg_flags) && !mapEntry->IsBattleground())
+        {
+            TC_LOG_WARN("server.loading", "WP {} has BG-only flags {} for non-BG map {}! Removing...", id, (flags & nonbg_flags), mapEntry->ID);
+            flags &= ~nonbg_flags;
+        }
+
+        const uint32 conflicting_flags_1 = AsUnderlyingType(BotWPFlags::BOTWP_FLAG_ALLIANCE_ONLY) | AsUnderlyingType(BotWPFlags::BOTWP_FLAG_HORDE_ONLY);
+        if ((flags & conflicting_flags_1) == conflicting_flags_1)
+        {
+            TC_LOG_WARN("server.loading", "WP {} has conflicting flags {}+{}! Removing both...",
+                id, AsUnderlyingType(BotWPFlags::BOTWP_FLAG_ALLIANCE_ONLY), AsUnderlyingType(BotWPFlags::BOTWP_FLAG_HORDE_ONLY));
+            flags &= ~conflicting_flags_1;
+        }
+
+        if (mapEntry->IsContinent() && !BotMgr::IsBotGenerationEnabledWorldMapId(mapId))
+        {
+            ++disabled_nodes;
+            continue;
+        }
+
+        WanderNode* wp = new WanderNode(id, mapId, x, y, z, o, zoneId, areaId, name);
+        wp->SetLevels(minLevel, maxLevel);
+        wp->SetFlags(BotWPFlags(flags));
+
+        if (wp->HasFlag(BotWPFlags::BOTWP_FLAG_SPAWN) && !lstr.empty())
+            all_spawn_nodes.push_back(wp);
+
+        if (lstr.empty())
+        {
+            TC_LOG_ERROR("server.loading", "WP {} has no links!", id);
+            continue;
+        }
+        std::vector<std::string_view> tok = Trinity::Tokenize(lstr, ' ', false);
+        for (std::vector<std::string_view>::size_type i = 0; i != tok.size(); ++i)
+        {
+            std::vector<std::string_view> link_str = Trinity::Tokenize(tok[i], ':', false);
+            ASSERT(link_str.size() == 2u, "Invalid links_str format: '%s'", std::string(tok[i].data(), tok[i].length()).c_str());
+            ASSERT(link_str[0].find(" ") == std::string_view::npos);
+            ASSERT(link_str[1].find(" ") == std::string_view::npos);
+            ASSERT(Trinity::StringTo<uint32>(link_str[0]) != std::nullopt, "Invalid links_str format: '%s'", std::string(tok[i].data(), tok[i].length()).c_str());
+            ASSERT(Trinity::StringTo<uint32>(link_str[1]) != std::nullopt, "Invalid links_str format: '%s'", std::string(tok[i].data(), tok[i].length()).c_str());
+
+            std::pair<std::string, std::string> tok_pair = { std::string(link_str[0].data(), link_str[0].length()), std::string(link_str[1].data(), link_str[1].length()) };
+            if (links_to_create.find(id) == links_to_create.cend())
+                links_to_create[id] = { wp, {std::move(tok_pair)} };
+            else
+                links_to_create.at(id).second.push_back(std::move(tok_pair));
+        }
+
+    } while (wres->NextRow());
+
+    for (WanderNode const* wp : all_spawn_nodes)
+    {
+        uint32 mapId = wp->GetMapId();
+        auto [minLevel, maxLevel] = wp->GetLevels();
+
+        spawn_node_exists_a[mapId] |= (maxLevel >= maxof_minclasslvl_nr && !wp->HasFlag(BotWPFlags::BOTWP_FLAG_HORDE_ONLY));
+        spawn_node_exists_h[mapId] |= (maxLevel >= maxof_minclasslvl_nr && !wp->HasFlag(BotWPFlags::BOTWP_FLAG_ALLIANCE_ONLY));
+        spawn_node_exists_n[mapId] |= (maxLevel >= maxof_minclasslvl_ex && !wp->HasFlag(BotWPFlags::BOTWP_FLAG_ALLIANCE_OR_HORDE_ONLY));
+
+        decltype(_wpMinSpawnLevelPerMapId)::const_iterator mincit = _wpMinSpawnLevelPerMapId.find(mapId);
+        _wpMinSpawnLevelPerMapId[mapId] = std::min<uint8>((mincit != _wpMinSpawnLevelPerMapId.cend()) ? mincit->second : uint8(DEFAULT_MAX_LEVEL), minLevel);
+        decltype(_wpMaxSpawnLevelPerMapId)::const_iterator maxcit = _wpMaxSpawnLevelPerMapId.find(mapId);
+        _wpMaxSpawnLevelPerMapId[mapId] = std::max<uint8>((maxcit != _wpMaxSpawnLevelPerMapId.cend()) ? maxcit->second : 1u, maxLevel);
+    }
+
+    bool spawn_node_minclasslvl_exists_all = true;
+    for (auto& kv : spawn_node_exists_a)
+    {
+        if (!kv.second)
+        {
+            TC_LOG_FATAL("server.loading", "No valid Alliance spawn node for at least level {} on map {}! Spawning wandering bots is impossible! Aborting.",
+                maxof_minclasslvl_nr, kv.first);
+            spawn_node_minclasslvl_exists_all = false;
+        }
+    }
+    for (auto& kv : spawn_node_exists_h)
+    {
+        if (!kv.second)
+        {
+            TC_LOG_FATAL("server.loading", "No valid Horde spawn node for at least level {} on map {}! Spawning wandering bots is impossible! Aborting.",
+                maxof_minclasslvl_nr, kv.first);
+            spawn_node_minclasslvl_exists_all = false;
+        }
+    }
+    for (auto& kv : spawn_node_exists_n)
+    {
+        if (!kv.second)
+        {
+            if (sMapStore.LookupEntry(kv.first)->IsBattlegroundOrArena())
+                TC_LOG_INFO("server.loading", "No valid Neutral spawn node for at least level {} on non-continent map {}.", maxof_minclasslvl_ex, kv.first);
+            else
+            {
+                TC_LOG_FATAL("server.loading", "No valid Neutral spawn node for at least level {} on map {}! Spawning wandering bots is impossible! Aborting.",
+                    maxof_minclasslvl_ex, kv.first);
+                spawn_node_minclasslvl_exists_all = false;
+            }
+        }
+    }
+    if (!spawn_node_minclasslvl_exists_all)
+        ABORT();
+
+    const uint8 TEAMS_COUNT = TEAM_NEUTRAL + 1;
+    char const* const team_strs[TEAMS_COUNT] = { "Alliance", "Horde", "Neutral" };
+    std::array<bool, DEFAULT_MAX_LEVEL> spawn_node_levels[TEAMS_COUNT]{ { false } };
+    uint8 min_spawn_level = DEFAULT_MAX_LEVEL;
+    uint8 max_spawn_level = 0;
+    for (WanderNode const* wp : all_spawn_nodes)
+    {
+        if (sMapStore.LookupEntry(wp->GetMapId())->IsContinent() && BotMgr::IsBotGenerationEnabledWorldMapId(wp->GetMapId()))
+        {
+            auto [minLevel, maxLevel] = wp->GetLevels();
+            min_spawn_level = std::min<uint32>(min_spawn_level, minLevel);
+            max_spawn_level = std::max<uint32>(max_spawn_level, maxLevel);
+        }
+    }
+    for (WanderNode const* wp : all_spawn_nodes)
+    {
+        if (sMapStore.LookupEntry(wp->GetMapId())->IsContinent())
+        {
+            auto [minLevel, maxLevel] = wp->GetLevels();
+            minLevel = std::max<uint8>(minLevel, 1);
+            maxLevel = std::min<uint8>(maxLevel, max_spawn_level);
+            for (uint8 k = 0; k < TEAMS_COUNT; ++k)
+            {
+                if ((k == 0 && !wp->HasFlag(BotWPFlags::BOTWP_FLAG_HORDE_ONLY)) ||
+                    (k == 1 && !wp->HasFlag(BotWPFlags::BOTWP_FLAG_ALLIANCE_ONLY)) ||
+                    (k == 2 && !wp->HasFlag(BotWPFlags::BOTWP_FLAG_ALLIANCE_OR_HORDE_ONLY)))
+                {
+                    for (uint8 i = minLevel; i <= maxLevel; ++i)
+                        spawn_node_levels[k][i - 1] = true;
+                }
+            }
+        }
+    }
+    for (uint8 k = 0; k < TEAMS_COUNT; ++k)
+    {
+        auto const& vec = spawn_node_levels[k];
+        for (uint32 i = min_spawn_level; i <= max_spawn_level; ++i)
+        {
+            if (vec[i - 1] == false)
+                TC_LOG_ERROR("server.loading", "No {} spawn node found for level {}! Wandering bots may cause a crash!", team_strs[k], i);
+        }
+    }
+
+    float mindist = 50000.f;
+    float maxdist = 0.f;
+    for (auto const& vt : links_to_create)
+    {
+        for (auto const& p : vt.second.second)
+        {
+            uint32 lid = *Trinity::StringTo<uint32>(p.first);
+            if (lid == vt.first)
+            {
+                TC_LOG_ERROR("server.loading", "WP {} has link {} which links to itself! Skipped.", vt.first, lid);
+                continue;
+            }
+
+            WanderNode* lwp = WanderNode::FindInAllWPs(lid);
+            if (!lwp)
+            {
+                TC_LOG_ERROR("server.loading", "WP {} has link {} which does not exist!", vt.first, lid);
+                continue;
+            }
+            if (lwp->GetMapId() != vt.second.first->GetMapId())
+            {
+                TC_LOG_ERROR("server.loading", "WP {} map {} has link {} ON A DIFFERENT MAP {}!", vt.first, vt.second.first->GetMapId(), lid, lwp->GetMapId());
+                continue;
+            }
+
+            bool is_continent = sMapStore.LookupEntry(vt.second.first->GetMapId())->IsContinent();
+            float lwpdist2d = vt.second.first->GetExactDist2d(lwp);
+            if (lwpdist2d > MAX_WANDER_NODE_DISTANCE)
+                TC_LOG_WARN("server.loading", "Warning! Link distance between WP {} and {} is too great ({})", vt.first, lid, lwpdist2d);
+            if (lwpdist2d < MIN_WANDER_NODE_DISTANCE && is_continent)
+                TC_LOG_WARN("server.loading", "Warning! Link distance between WP {} and {} is low ({})", vt.first, lid, lwpdist2d);
+
+            vt.second.first->Link(lwp, true);
+
+            if (is_continent)
+            {
+                float dist2d = vt.second.first->GetExactDist2d(lwp);
+                if (dist2d < mindist)
+                    mindist = dist2d;
+                if (dist2d > maxdist)
+                    maxdist = dist2d;
+            }
+        }
+    }
+
+    std::set<WanderNode const*> tops;
+    WanderNode::DoForAllWPs([&](WanderNode const* wp) {
+        if (tops.count(wp) == 0u && wp->GetLinks().size() == 1u)
+        {
+            TC_LOG_DEBUG("server.loading", "Node {} ('{}') has single connection!", wp->GetWPId(), wp->GetName());
+            WanderNode const* tn = wp->GetLinks().front();
+            WanderNode const* prev = nullptr;
+            std::vector<WanderNode const*> sc_chain;
+            sc_chain.push_back(wp);
+            tops.emplace(wp);
+            while (tn != wp)
+            {
+                if (tn->GetLinks().size() != 2u || !tn->HasLink(prev ? prev : wp))
+                {
+                    sc_chain.push_back(tn);
+                    break;
+                }
+                prev = sc_chain.back();
+                sc_chain.push_back(tn);
+                tn = *std::find_if_not(std::cbegin(tn->GetLinks()), std::cend(tn->GetLinks()), [=](WanderNode const* lwp) { return lwp == prev; });
+            }
+            if (sc_chain.back()->GetLinks().size() == 1u && prev && sc_chain.back()->GetLinks().front() == prev)
+            {
+                TC_LOG_DEBUG("server.loading", "Node {} ('{}') has single connection!", tn->GetWPId(), tn->GetName());
+                tops.emplace(sc_chain.back());
+                std::ostringstream ss;
+                ss << "Node " << (sc_chain.size() == 2u ? "pair " : "chain ");
+                for (uint32 i = 0u; i < sc_chain.size(); ++i)
+                {
+                    ss << sc_chain[i]->GetWPId();
+                    if (i < sc_chain.size() - 1u)
+                        ss << '-';
+                }
+                ss << " is isolated!";
+                TC_LOG_INFO("server.loading", "{}", ss.str());
+            }
+        }
+    });
+
+    TC_LOG_INFO("server.loading", ">> Loaded {} bot wander nodes ({} disabled) on {} maps (total {} tops) in {} ms",
+        uint32(WanderNode::GetAllWPsCount()), disabled_nodes, uint32(WanderNode::GetWPMapsCount()), uint32(tops.size()), GetMSTimeDiffToNow(botoldMSTime));
 }
 
 void BotDataMgr::GenerateWanderingBots()
 {
-    using NodeType = BotTravelGraph::BotTravelNode;
+    const uint32 wandering_bots_desired = BotMgr::GetDesiredWanderingBotsCount();
 
-    const std::map<uint8, uint32> wbot_faction_for_ex_class = {
-        {BOT_CLASS_BM, 2u},
-        {BOT_CLASS_SPHYNX, 14u},
-        {BOT_CLASS_ARCHMAGE, 1u},
-        {BOT_CLASS_DREADLORD, 14u},
-        {BOT_CLASS_SPELLBREAKER, 1610u},
-        {BOT_CLASS_DARK_RANGER, 14u},
-        {BOT_CLASS_NECROMANCER, 14u},
-        {BOT_CLASS_SEA_WITCH, 14u}
-    };
-
-    const uint32 WANDERING_BOTS_COUNT = BotMgr::GetDesiredWanderingBotsCount();
-
-    if (WANDERING_BOTS_COUNT == 0)
+    if (wandering_bots_desired == 0)
         return;
-
-    FillWanderMap();
 
     TC_LOG_INFO("server.loading", "Spawning wandering bots...");
 
     uint32 oldMSTime = getMSTime();
 
-    std::map<uint8, std::set<uint32>> spareBotIdsPerClassMap;
-    for (uint8 c = BOT_CLASS_WARRIOR; c < BOT_CLASS_END; ++c)
-        if (c != BOT_CLASS_BM && BotMgr::IsClassEnabled(c) && spareBotIdsPerClassMap.find(c) == spareBotIdsPerClassMap.cend())
-            spareBotIdsPerClassMap.insert({ c, {} });
+    uint32 maxbots = sBotGen->GetSpareBotsCount();
+    uint32 enabledbots = sBotGen->GetEnabledBotsCount();
 
-    uint32 maxWanderingBots = 0;
-    for (decltype(_botsExtras)::value_type const& vt : _botsExtras)
+    if (maxbots < wandering_bots_desired)
     {
-        uint8 c = vt.second->bclass;
-        if (c != BOT_CLASS_NONE && c != BOT_CLASS_BM && BotMgr::IsClassEnabled(c) && _botsData.find(vt.first) == _botsData.end())
-        {
-            ASSERT(spareBotIdsPerClassMap.find(c) != spareBotIdsPerClassMap.cend());
-            spareBotIdsPerClassMap.at(c).insert(vt.first);
-            ++maxWanderingBots;
-        }
-    }
-
-    for (uint8 c = BOT_CLASS_WARRIOR; c < BOT_CLASS_END; ++c)
-        if (spareBotIdsPerClassMap.find(c) != spareBotIdsPerClassMap.cend() && spareBotIdsPerClassMap.at(c).empty())
-            spareBotIdsPerClassMap.erase(c);
-
-    if (maxWanderingBots < WANDERING_BOTS_COUNT)
-    {
-        TC_LOG_FATAL("server.loading", "Only %u out of %u bots of enabled classes aren't spawned. Desired amount of wandering bots (%u) cannot be created. Aborting!",
-            maxWanderingBots, uint32(_botsExtras.size()), WANDERING_BOTS_COUNT);
+        TC_LOG_FATAL("server.loading", "Only {} out of {} bots of enabled classes aren't spawned. Desired amount of wandering bots ({}) cannot be created. Aborting!",
+            maxbots, enabledbots, wandering_bots_desired);
         ASSERT(false);
     }
 
-    uint32 bot_id = BOT_ENTRY_CREATE_BEGIN - 1;
-    QueryResult result = CharacterDatabase.PQuery("SELECT value FROM worldstates WHERE entry = %u", uint32(BOT_GIVER_ENTRY));
-    if (!result)
+    uint32 spawned_count = 0;
+    if (!sBotGen->GenerateWanderingBotsToSpawn(wandering_bots_desired, -1, -1, false, nullptr, nullptr, spawned_count))
     {
-        TC_LOG_WARN("server.loading", "Next bot id for autogeneration is not found! Resetting! (client cache may interfere with names)");
-        for (uint32 bot_cid : GetExistingNPCBotIds())
-            if (bot_cid > bot_id)
-                bot_id = bot_cid;
-        CharacterDatabase.DirectPExecute("INSERT INTO worldstates (entry, value, comment) VALUES (%u, %u, '%s')",
-            uint32(BOT_GIVER_ENTRY), bot_id, "NPCBOTS MOD - last autogenerated bot entry");
+        TC_LOG_FATAL("server.loading", "Failed to spawn all {} bots ({} succeeded)!", wandering_bots_desired, spawned_count);
+        ASSERT(false);
     }
-    else
-        bot_id = result->Fetch()[0].GetUInt32();
 
-    ASSERT(bot_id > BOT_ENTRY_BEGIN);
+    TC_LOG_INFO("server.loading", ">> Set up spawning of {} wandering bots in {} ms", spawned_count, GetMSTimeDiffToNow(oldMSTime));
+}
 
-    CreatureTemplateContainer const& all_templates = sObjectMgr->GetCreatureTemplates();
+bool BotDataMgr::GenerateBattlegroundBots(Player const* groupLeader, [[maybe_unused]] Group const* group, BattlegroundQueue* queue, PvPDifficultyEntry const* bracketEntry, GroupQueueInfo const* gqinfo)
+{
+    if (!BotMgr::IsBotGenerationEnabledBGs())
+        return true;
 
-    auto find_bot_creature_template_by_botclass = [&spareBotIdsPerClassMap](uint8 b_class) -> CreatureTemplate const* {
-        ASSERT(spareBotIdsPerClassMap.find(b_class) != spareBotIdsPerClassMap.cend());
-        auto const& cSet = spareBotIdsPerClassMap.at(b_class);
-        uint32 entry = cSet.size() == 1 ? *cSet.cbegin() : Trinity::Containers::SelectRandomContainerElement(cSet);
-        return sObjectMgr->GetCreatureTemplate(entry);
-    };
+    BattlegroundTypeId bgTypeId = gqinfo->BgTypeId;
+    uint8 atype = gqinfo->ArenaType;
+    uint32 ammr = gqinfo->ArenaMatchmakerRating;
+    BattlegroundBracketId bracketId = bracketEntry->GetBracketId();
+    BattlegroundQueueTypeId bgqTypeId = sBattlegroundMgr->BGQueueTypeId(bgTypeId, atype);
 
-    auto remove_bot_orig_entry_from_available = [&spareBotIdsPerClassMap](uint8 bclass, uint32 botId) {
-        ASSERT(spareBotIdsPerClassMap.find(bclass) != spareBotIdsPerClassMap.cend());
-        ASSERT(spareBotIdsPerClassMap.at(bclass).find(botId) != spareBotIdsPerClassMap.at(bclass).cend());
-        spareBotIdsPerClassMap.at(bclass).erase(botId);
-        if (spareBotIdsPerClassMap.at(bclass).empty())
-            spareBotIdsPerClassMap.erase(bclass);
-    };
+    uint32 tarteamplayers = BotMgr::GetBGTargetTeamPlayersCount(bgTypeId);
 
-    std::set<uint32> botgrids;
-    for (int32 i = 0; i < int32(WANDERING_BOTS_COUNT); ++i) // i is unused as value
+    if (tarteamplayers == 0)
     {
-        while (all_templates.find(++bot_id) != all_templates.cend()) {}
+        TC_LOG_INFO("npcbots", "[Disabled] BG {} wandering bots generation is disabled (not implemented?)", uint32(bgTypeId));
+        return true;
+    }
 
-        uint8 bot_class = Trinity::Containers::SelectRandomContainerElement(spareBotIdsPerClassMap).first;
-        CreatureTemplate const* orig_template = find_bot_creature_template_by_botclass(bot_class);
-        ASSERT(orig_template);
-
-        CreatureTemplate& bot_template = _botsWanderCreatureTemplates[bot_id];
-        //copy all fields
-        //pointers to non-const objects: QueryData[TOTAL_LOCALES]
-        bot_template = *orig_template;
-        bot_template.Entry = bot_id;
-        //bot_template.Name = bot_template.Name;
-        bot_template.Title = "";
-        //possibly need to override whole array (and pointer)
-        bot_template.InitializeQueryData();
-
-        NpcBotExtras const* orig_extras = SelectNpcBotExtras(orig_template->Entry);
-        ASSERT_NOTNULL(orig_extras);
-        ChrRacesEntry const* rentry = sChrRacesStore.LookupEntry(orig_extras->race);
-        uint32 bot_faction = (bot_class >= BOT_CLASS_EX_START) ? wbot_faction_for_ex_class.find(bot_class)->second : rentry ? rentry->FactionID : 14;
-
-        NpcBotData* bot_data = new NpcBotData(bot_ai::DefaultRolesForClass(bot_class), bot_faction, bot_ai::DefaultSpecForClass(bot_class));
-        _botsData[bot_id] = bot_data;
-        NpcBotExtras* bot_extras = new NpcBotExtras();
-        bot_extras->bclass = bot_class;
-        bot_extras->race = orig_extras->race;
-        _botsExtras[bot_id] = bot_extras;
-        if (NpcBotAppearanceData const* orig_apdata = SelectNpcBotAppearance(orig_template->Entry))
+    //find running BG
+    auto const& all_bgs = sBattlegroundMgr->GetBgDataStore();
+    for (auto const& kv : all_bgs)
+    {
+        if (kv.first == bgTypeId)
         {
-            NpcBotAppearanceData* bot_apdata = new NpcBotAppearanceData();
-            bot_apdata->face = orig_apdata->face;
-            bot_apdata->features = orig_apdata->features;
-            bot_apdata->gender = orig_apdata->gender;
-            bot_apdata->hair = orig_apdata->hair;
-            bot_apdata->haircolor = orig_apdata->haircolor;
-            bot_apdata->skin = orig_apdata->skin;
-            _botsAppearanceData[bot_id] = bot_apdata;
+            for (auto const& real_bg_pair : kv.second.m_Battlegrounds)
+            {
+                Battleground const* real_bg = real_bg_pair.second;
+                if (real_bg->GetInstanceID() != 0 && real_bg->GetBracketId() == bracketId &&
+                    real_bg->GetStatus() < STATUS_WAIT_LEAVE && real_bg->HasFreeSlots())
+                {
+                    TC_LOG_INFO("npcbots", "[Already running] Found running BG {} inited by player {} ({}). Not generating bots",
+                        uint32(bgTypeId), groupLeader->GetName(), groupLeader->GetGUID().GetCounter());
+                    return true;
+                }
+            }
         }
-        int8 beqId = 1;
-        _botsWanderCreatureEquipmentTemplates[bot_id] = sObjectMgr->GetEquipmentInfo(orig_template->Entry, beqId);
+    }
 
-        //We do not create CreatureData for generated bots
+    Battleground const* bg_template = sBattlegroundMgr->GetBattlegroundTemplate(bgTypeId);
 
-        NodeType const* spawnLoc = nullptr;
+    if (!bg_template)
+        return false;
+
+    uint32 minteamplayers = bg_template->GetMinPlayersPerTeam();
+    uint32 maxteamplayers = bg_template->GetMaxPlayersPerTeam();
+
+    RoundToInterval(tarteamplayers, minteamplayers, maxteamplayers);
+
+    uint32 queued_players_a = 0;
+    uint32 queued_players_h = 0;
+    for (uint8 i = 0; i < BG_QUEUE_GROUP_TYPES_COUNT; ++i)
+    {
+        for (GroupQueueInfo const* qgr : queue->m_QueuedGroups[bracketId][i])
+        {
+            if (qgr->Team == ALLIANCE)
+                queued_players_a += qgr->Players.size();
+            else
+                queued_players_h += qgr->Players.size();
+        }
+    }
+
+    uint32 needed_bots_count_a = (queued_players_a < tarteamplayers) ? (tarteamplayers - queued_players_a) : 0;
+    uint32 needed_bots_count_h = (queued_players_h < tarteamplayers) ? (tarteamplayers - queued_players_h) : 0;
+
+    ASSERT(needed_bots_count_a <= maxteamplayers);
+    ASSERT(needed_bots_count_h <= maxteamplayers);
+
+    if (needed_bots_count_a + needed_bots_count_h == 0)
+    {
+        TC_LOG_INFO("npcbots", "[No bots required] Failed to generate bots for BG {} inited by player {} ({})",
+            uint32(bgTypeId), groupLeader->GetName(), groupLeader->GetGUID().GetCounter());
+        return true;
+    }
+
+    uint32 spare_bots_a = sBotGen->GetSpareBotsCount(TEAM_ALLIANCE);
+    uint32 spare_bots_h = sBotGen->GetSpareBotsCount(TEAM_HORDE);
+
+    if (queued_players_a + spare_bots_a < minteamplayers)
+    {
+        TC_LOG_INFO("npcbots", "[Not enough A bots] Failed to generate bots for BG {} inited by player {} ({})",
+            uint32(bgTypeId), groupLeader->GetName(), groupLeader->GetGUID().GetCounter());
+        return false;
+    }
+    if (queued_players_h + spare_bots_h < minteamplayers)
+    {
+        TC_LOG_INFO("npcbots", "[Not enough H bots] Failed to generate bots for BG {} inited by player {} ({})",
+            uint32(bgTypeId), groupLeader->GetName(), groupLeader->GetGUID().GetCounter());
+        return false;
+    }
+
+    needed_bots_count_a = std::min<uint32>(needed_bots_count_a, spare_bots_a);
+    needed_bots_count_h = std::min<uint32>(needed_bots_count_h, spare_bots_h);
+
+    uint32 spawned_a = 0;
+    uint32 spawned_h = 0;
+    NpcBotRegistry spawned_bots_a;
+    NpcBotRegistry spawned_bots_h;
+
+    if (needed_bots_count_a)
+    {
+        if (!sBotGen->GenerateWanderingBotsToSpawn(needed_bots_count_a, bg_template->GetMapId(), ALLIANCE, true, bracketEntry, &spawned_bots_a, spawned_a))
+        {
+            TC_LOG_WARN("npcbots", "Failed to spawn {} ALLIANCE bots for BG {} '{}' queued A {} H {} req A {} H {} spare {}",
+                needed_bots_count_a, uint32(bg_template->GetTypeID()), bg_template->GetName(),
+                queued_players_a, queued_players_h, needed_bots_count_a, needed_bots_count_h, spare_bots_a);
+            for (NpcBotRegistry const* registry1 : { &spawned_bots_a, &spawned_bots_h })
+                for (Creature const* bot : *registry1)
+                    DespawnWandererBot(bot->GetEntry());
+            return false;
+        }
+    }
+    if (needed_bots_count_h)
+    {
+        if (!sBotGen->GenerateWanderingBotsToSpawn(needed_bots_count_h, bg_template->GetMapId(), HORDE, true, bracketEntry, &spawned_bots_h, spawned_h))
+        {
+            TC_LOG_WARN("npcbots", "Failed to spawn {} HORDE bots for BG {} '{}' queued A {} H {} req A {} H {} spare {}",
+                needed_bots_count_h, uint32(bg_template->GetTypeID()), bg_template->GetName(),
+                queued_players_a, queued_players_h, needed_bots_count_a, needed_bots_count_h, spare_bots_h);
+            for (NpcBotRegistry const* registry2 : { &spawned_bots_a, &spawned_bots_h })
+                for (Creature const* bot : *registry2)
+                    DespawnWandererBot(bot->GetEntry());
+            return false;
+        }
+    }
+
+    ASSERT(uint32(spawned_bots_a.size()) == needed_bots_count_a);
+    ASSERT(uint32(spawned_bots_h.size()) == needed_bots_count_h);
+
+    botBGJoinEvents[groupLeader->GetGUID()].AddEventAtOffset([ammr = ammr, atype = atype, bgqTypeId = bgqTypeId, bgTypeId = bgTypeId, bracketId = bracketId]() {
+        sBattlegroundMgr->ScheduleQueueUpdate(ammr, atype, bgqTypeId, bgTypeId, bracketId);
+    }, Seconds(2));
+
+    for (NpcBotRegistry const* registry3 : { &spawned_bots_a, &spawned_bots_h })
+    {
+        uint32 seconds_delay = 5;
+        for (Creature const* bot : *registry3)
+        {
+            bot->GetBotAI()->SetBotCommandState(BOT_COMMAND_STAY);
+            bot->GetBotAI()->canUpdate = false;
+
+            const_cast<Creature*>(bot)->SetPvP(true);
+            queue->AddBotAsGroup(bot->GetGUID(), GetTeamIdForFaction(bot->GetFaction()) == TEAM_HORDE ? HORDE : ALLIANCE,
+                bgTypeId, bracketEntry, atype, false, gqinfo->ArenaTeamRating, ammr);
+
+            seconds_delay = std::min<uint32>(uint32(MINUTE * 2), seconds_delay + std::max<uint32>(1u, uint32((MINUTE / 2) / std::max<uint32>(needed_bots_count_a, needed_bots_count_h))));
+
+            BotBattlegroundEnterEvent* bbe = new BotBattlegroundEnterEvent(groupLeader->GetGUID(), bot->GetGUID(), bgqTypeId,
+                botBGJoinEvents[groupLeader->GetGUID()].CalculateTime(Milliseconds(uint32(INVITE_ACCEPT_WAIT_TIME) + uint32(BG_START_DELAY_2M))).count());
+            botBGJoinEvents[groupLeader->GetGUID()].AddEventAtOffset(bbe, Seconds(seconds_delay));
+        }
+    }
+
+    return true;
+}
+
+ItemPerBotClassMap const& BotDataMgr::GetWanderingBotsSortedGearMap()
+{
+    return _botsWanderCreaturesSortedGear;
+}
+
+void BotDataMgr::CreateWanderingBotsSortedGear()
+{
+    TC_LOG_INFO("server.loading", "Sorting wandering bot's gear...");
+
+    uint32 oldMSTime = getMSTime();
+
+    std::set<uint32> disabled_item_ids;
+    QueryResult dires = WorldDatabase.Query("SELECT id FROM creature_template_npcbot_disabled_items");
+    if (dires)
+    {
         do
         {
-            auto const& spair = Trinity::Containers::SelectRandomContainerElement(Trinity::Containers::SelectRandomContainerElement(WanderMap.Nodes).second);
-            if (spair.second.maxlevel >= GetMinLevelForBotClass(bot_class))
-                spawnLoc = &spair.second;
+            uint32 id = dires->Fetch()->GetUInt32();
+            disabled_item_ids.insert(id);
 
-        } while (spawnLoc == nullptr);
+        } while (dires->NextRow());
 
-        CellCoord c = Trinity::ComputeCellCoord(spawnLoc->m_positionX, spawnLoc->m_positionY);
-        GridCoord g = Trinity::ComputeGridCoord(spawnLoc->m_positionX, spawnLoc->m_positionY);
-        ASSERT(c.IsCoordValid(), "Invalid Cell coord!");
-        ASSERT(g.IsCoordValid(), "Invalid Grid coord!");
-        Map* map = sMapMgr->CreateBaseMap(spawnLoc->m_mapId);
-        map->LoadGrid(spawnLoc->m_positionX, spawnLoc->m_positionY);
-        ASSERT(!map->Instanceable(), map->GetDebugInfo().c_str());
+        TC_LOG_INFO("server.loading", ">> Loaded {} disabled wandering bots gear items", uint32(disabled_item_ids.size()));
+    }
+    else
+        TC_LOG_INFO("server.loading", ">> Loaded 0 disabled wandering bots gear items. Table `creature_template_npcbot_disabled_items` is empty!");
 
-        TC_LOG_INFO("npcbots", "Spawning wandering bot: %s (%u) class %u race %u fac %u, location: mapId %u %s (%s)",
-            bot_template.Name.c_str(), bot_id, uint32(bot_extras->bclass), uint32(bot_extras->race), bot_data->faction,
-            spawnLoc->m_mapId, spawnLoc->ToString().c_str(), spawnLoc->name.c_str());
-        Position spos;
-        spos.Relocate(spawnLoc->m_positionX, spawnLoc->m_positionY, spawnLoc->m_positionZ, spawnLoc->GetOrientation());
-        Creature* bot = new Creature();
-        if (!bot->Create(map->GenerateLowGuid<HighGuid::Unit>(), map, PHASEMASK_NORMAL, bot_id, spos))
+    const std::map<uint32, uint8> InvTypeToBotSlot = {
+        {INVTYPE_HEAD, BOT_SLOT_HEAD},
+        {INVTYPE_SHOULDERS, BOT_SLOT_SHOULDERS},
+        {INVTYPE_CHEST, BOT_SLOT_CHEST},
+        {INVTYPE_ROBE, BOT_SLOT_CHEST},
+        {INVTYPE_WAIST, BOT_SLOT_WAIST},
+        {INVTYPE_LEGS, BOT_SLOT_LEGS},
+        {INVTYPE_FEET, BOT_SLOT_FEET},
+        {INVTYPE_WRISTS, BOT_SLOT_WRIST},
+        {INVTYPE_HANDS, BOT_SLOT_HANDS}
+    };
+
+    auto push_gear_to_classes = [](ItemTemplate const& itt, uint8 slot, uint8 lstep, std::initializer_list<BotClasses> const& cs) {
+        for (BotClasses c : cs)
         {
-            delete bot;
-            TC_LOG_FATAL("server.loading", "Creature is not created!");
-            ASSERT(false);
+            if (c == BOT_CLASS_SPHYNX &&
+                (itt.InventoryType == INVTYPE_FINGER || itt.InventoryType == INVTYPE_TRINKET || itt.InventoryType == INVTYPE_CLOAK || itt.InventoryType == INVTYPE_NECK || itt.InventoryType == INVTYPE_SHIELD))
+                continue;
+            if (!itt.AllowableClass || itt.AllowableClass >= ((1u << MAX_CLASSES) - 1) || !!(itt.AllowableClass & (1 << (c - 1))))
+                _botsWanderCreaturesSortedGear[c][slot][lstep].push_back(itt.ItemId);
         }
-        if (!bot->LoadBotCreatureFromDB(0, map, true, true, bot_id, &spos))
+    };
+
+    const std::initializer_list<BotClasses> IntUsers = { BOT_CLASS_PALADIN, BOT_CLASS_PRIEST, BOT_CLASS_SHAMAN, BOT_CLASS_MAGE, BOT_CLASS_WARLOCK, BOT_CLASS_DRUID, BOT_CLASS_SPHYNX, BOT_CLASS_ARCHMAGE, BOT_CLASS_DREADLORD, BOT_CLASS_NECROMANCER, BOT_CLASS_SEA_WITCH, BOT_CLASS_CRYPT_LORD };
+    const std::initializer_list<BotClasses> StrUsers = { BOT_CLASS_WARRIOR, BOT_CLASS_DEATH_KNIGHT, BOT_CLASS_SPELLBREAKER, BOT_CLASS_CRYPT_LORD };
+    const std::initializer_list<BotClasses> AgiUsers = { BOT_CLASS_HUNTER, BOT_CLASS_SHAMAN, BOT_CLASS_ROGUE, BOT_CLASS_DRUID, BOT_CLASS_BM, BOT_CLASS_DARK_RANGER };
+
+    ItemTemplateContainer const& all_item_templates = sObjectMgr->GetItemTemplateStore();
+    for (auto const& kv : all_item_templates)
+    {
+        ItemTemplate const& proto = kv.second;
+
+        if (!proto.ItemLevel || proto.RequiredSpell)
+            continue;
+
+        bool skip = false;
+        switch (proto.Quality)
         {
-            delete bot;
-            TC_LOG_FATAL("server.loading", "Cannot load npcbot from DB!");
-            ASSERT(false);
+            case ITEM_QUALITY_NORMAL:
+                if (std::any_of(proto.Spells.cbegin(), proto.Spells.cend(), [](_Spell const& spell) { return !!spell.SpellId; }))
+                    skip = true;
+                if (proto.RequiredLevel > 14)
+                    skip = true;
+                break;
+            case ITEM_QUALITY_UNCOMMON:
+                if (proto.RequiredLevel > 75)
+                    skip = true;
+            [[fallthrough]];
+            case ITEM_QUALITY_RARE:
+                if (proto.RequiredLevel > 75 && proto.RequiredLevel < 80)
+                    skip = true;
+            [[fallthrough]];
+            case ITEM_QUALITY_EPIC:
+                if (!(proto.RequiredLevel >= 2 && proto.RequiredLevel <= DEFAULT_MAX_LEVEL))
+                    skip = true;
+                if (!proto.RandomProperty && !proto.RandomSuffix && !proto.StatsCount &&
+                    !(proto.Class == ITEM_CLASS_WEAPON && proto.SubClass == ITEM_SUBCLASS_WEAPON_WAND) &&
+                    !(proto.Class == ITEM_CLASS_WEAPON && proto.SubClass == ITEM_SUBCLASS_WEAPON_BOW && proto.RequiredLevel < 45))
+                    skip = true;
+                break;
+            default:
+                skip = true;
+                break;
+        }
+        if (skip)
+            continue;
+
+        if (!!disabled_item_ids.count(proto.ItemId))
+        {
+            //TC_LOG_INFO("server.loading", "Item {} is disabled...", proto.ItemId);
+            continue;
         }
 
-        bot->GetBotAI()->SetTravelNodeCur(spawnLoc->id);
+        if (proto.StatsCount > 0 && std::any_of(proto.ItemStat.cbegin(), proto.ItemStat.cend(), [](_ItemStat const& stat) {
+            return (stat.ItemStatType == ITEM_MOD_DEFENSE_SKILL_RATING || stat.ItemStatType == ITEM_MOD_DODGE_RATING ||
+                stat.ItemStatType == ITEM_MOD_PARRY_RATING || stat.ItemStatType == ITEM_MOD_BLOCK_VALUE) &&
+                stat.ItemStatValue > 0;
+        }))
+            continue;
 
-        remove_bot_orig_entry_from_available(bot_class, orig_template->Entry);
+        uint8 reqLstep = (((proto.RequiredLevel == 1) ? 0 : proto.RequiredLevel) + ITEM_SORTING_LEVEL_STEP - 1) / ITEM_SORTING_LEVEL_STEP;
+        bool is_caster_item = proto.StatsCount > 0 && std::any_of(proto.ItemStat.cbegin(), proto.ItemStat.cend(), [](_ItemStat const& stat) {
+            return (stat.ItemStatType == ITEM_MOD_INTELLECT || stat.ItemStatType == ITEM_MOD_SPELL_POWER ||
+                stat.ItemStatType == ITEM_MOD_SPELL_PENETRATION || stat.ItemStatType == ITEM_MOD_MANA_REGENERATION) &&
+                stat.ItemStatValue > 0;
+        });
+        bool is_strength_item = proto.StatsCount > 0 && std::any_of(proto.ItemStat.cbegin(), proto.ItemStat.cend(), [](_ItemStat const& stat) {
+            return stat.ItemStatType == ITEM_MOD_STRENGTH && stat.ItemStatValue > 0;
+        });
+        bool is_agility_item = proto.StatsCount > 0 && std::any_of(proto.ItemStat.cbegin(), proto.ItemStat.cend(), [](_ItemStat const& stat) {
+            return stat.ItemStatType == ITEM_MOD_AGILITY && stat.ItemStatValue > 0;
+        });
 
-        botgrids.insert(g.GetId());
+        switch (proto.Class)
+        {
+            case ITEM_CLASS_ARMOR:
+                switch (proto.InventoryType)
+                {
+                    case INVTYPE_NECK:
+                        if (proto.Quality < ITEM_QUALITY_UNCOMMON)
+                            break;
+                        if (is_caster_item || (reqLstep < LEVEL_STEPS - 1 && proto.StatsCount == 0))
+                            push_gear_to_classes(proto, BOT_SLOT_NECK, reqLstep, IntUsers);
+                        if (is_strength_item || (reqLstep < LEVEL_STEPS - 1 && proto.StatsCount == 0))
+                            push_gear_to_classes(proto, BOT_SLOT_NECK, reqLstep, StrUsers);
+                        if (is_agility_item || (reqLstep < LEVEL_STEPS - 1 && proto.StatsCount == 0))
+                            push_gear_to_classes(proto, BOT_SLOT_NECK, reqLstep, AgiUsers);
+                        break;
+                    case INVTYPE_FINGER:
+                        if (proto.Quality < ITEM_QUALITY_UNCOMMON)
+                            break;
+                        if (is_caster_item || (reqLstep < LEVEL_STEPS - 1 && proto.StatsCount == 0))
+                        {
+                            push_gear_to_classes(proto, BOT_SLOT_FINGER1, reqLstep, IntUsers);
+                            push_gear_to_classes(proto, BOT_SLOT_FINGER2, reqLstep, IntUsers);
+                        }
+                        if (is_strength_item || (reqLstep < LEVEL_STEPS - 1 && proto.StatsCount == 0))
+                        {
+                            push_gear_to_classes(proto, BOT_SLOT_FINGER1, reqLstep, StrUsers);
+                            push_gear_to_classes(proto, BOT_SLOT_FINGER2, reqLstep, StrUsers);
+                        }
+                        if (is_agility_item || (reqLstep < LEVEL_STEPS - 1 && proto.StatsCount == 0))
+                        {
+                            push_gear_to_classes(proto, BOT_SLOT_FINGER1, reqLstep, AgiUsers);
+                            push_gear_to_classes(proto, BOT_SLOT_FINGER2, reqLstep, AgiUsers);
+                        }
+                        break;
+                    case INVTYPE_TRINKET:
+                        if (proto.Quality < ITEM_QUALITY_UNCOMMON)
+                            break;
+                        if (!is_strength_item && !is_agility_item)
+                        {
+                            push_gear_to_classes(proto, BOT_SLOT_TRINKET1, reqLstep, IntUsers);
+                            push_gear_to_classes(proto, BOT_SLOT_TRINKET2, reqLstep, IntUsers);
+                        }
+                        if (!is_caster_item)
+                        {
+                            push_gear_to_classes(proto, BOT_SLOT_TRINKET1, reqLstep, StrUsers);
+                            push_gear_to_classes(proto, BOT_SLOT_TRINKET2, reqLstep, StrUsers);
+                            push_gear_to_classes(proto, BOT_SLOT_TRINKET1, reqLstep, AgiUsers);
+                            push_gear_to_classes(proto, BOT_SLOT_TRINKET2, reqLstep, AgiUsers);
+                        }
+                        break;
+                    case INVTYPE_CLOAK:
+                        if (is_caster_item || (reqLstep < LEVEL_STEPS - 1 && proto.StatsCount == 0))
+                            push_gear_to_classes(proto, BOT_SLOT_BACK, reqLstep, IntUsers);
+                        if (is_strength_item || (reqLstep < LEVEL_STEPS - 1 && proto.StatsCount == 0))
+                            push_gear_to_classes(proto, BOT_SLOT_BACK, reqLstep, StrUsers);
+                        if (is_agility_item || (reqLstep < LEVEL_STEPS - 1 && proto.StatsCount == 0))
+                            push_gear_to_classes(proto, BOT_SLOT_BACK, reqLstep, AgiUsers);
+                        break;
+                    case INVTYPE_HOLDABLE:
+                        if (proto.Quality < ITEM_QUALITY_UNCOMMON)
+                            break;
+                        push_gear_to_classes(proto, BOT_SLOT_OFFHAND, reqLstep, { BOT_CLASS_PRIEST, BOT_CLASS_MAGE, BOT_CLASS_WARLOCK, BOT_CLASS_DRUID });
+                        break;
+                    case INVTYPE_SHIELD:
+                        if (proto.Armor == 0)
+                            break;
+                        if (!is_caster_item)
+                            push_gear_to_classes(proto, BOT_SLOT_OFFHAND, reqLstep, { BOT_CLASS_WARRIOR });
+                        if (is_caster_item || proto.RequiredLevel < 60 || (proto.RequiredLevel < 69 && (proto.RandomProperty || proto.RandomSuffix)))
+                            push_gear_to_classes(proto, BOT_SLOT_OFFHAND, reqLstep, { BOT_CLASS_PALADIN, BOT_CLASS_SHAMAN, BOT_CLASS_SPELLBREAKER });
+                        break;
+                    case INVTYPE_HEAD:
+                    case INVTYPE_SHOULDERS:
+                    case INVTYPE_CHEST:
+                    case INVTYPE_ROBE:
+                    case INVTYPE_WAIST:
+                    case INVTYPE_LEGS:
+                    case INVTYPE_FEET:
+                    case INVTYPE_WRISTS:
+                    case INVTYPE_HANDS:
+                    {
+                        if (proto.Armor == 0)
+                            break;
+                        decltype(InvTypeToBotSlot)::const_iterator ci = InvTypeToBotSlot.find(proto.InventoryType);
+                        ASSERT(ci != InvTypeToBotSlot.cend());
+                        uint8 slot = ci->second;
+                        switch (proto.SubClass)
+                        {
+                            case ItemSubclassArmor::ITEM_SUBCLASS_ARMOR_CLOTH:
+                                if (slot == BOT_SLOT_CHEST && proto.InventoryType != INVTYPE_ROBE)
+                                    break;
+                                push_gear_to_classes(proto, slot, reqLstep, { BOT_CLASS_PRIEST, BOT_CLASS_MAGE, BOT_CLASS_WARLOCK, BOT_CLASS_ARCHMAGE, BOT_CLASS_NECROMANCER, BOT_CLASS_SEA_WITCH });
+                                break;
+                            case ItemSubclassArmor::ITEM_SUBCLASS_ARMOR_LEATHER:
+                                if (!is_caster_item)
+                                    push_gear_to_classes(proto, slot, reqLstep, { BOT_CLASS_ROGUE, BOT_CLASS_DARK_RANGER });
+                                push_gear_to_classes(proto, slot, reqLstep, { BOT_CLASS_DRUID });
+                                if (proto.RequiredLevel < 40)
+                                    push_gear_to_classes(proto, slot, reqLstep, { BOT_CLASS_HUNTER, BOT_CLASS_SHAMAN });
+                                break;
+                            case ItemSubclassArmor::ITEM_SUBCLASS_ARMOR_MAIL:
+                                if (proto.RequiredLevel < 40)
+                                {
+                                    if (!is_caster_item)
+                                        push_gear_to_classes(proto, slot, reqLstep, { BOT_CLASS_WARRIOR });
+                                    push_gear_to_classes(proto, slot, reqLstep, { BOT_CLASS_PALADIN });
+                                }
+                                else
+                                    push_gear_to_classes(proto, slot, reqLstep, { BOT_CLASS_HUNTER, BOT_CLASS_SHAMAN });
+                                if (!is_caster_item)
+                                    push_gear_to_classes(proto, slot, reqLstep, { BOT_CLASS_BM, BOT_CLASS_SPELLBREAKER });
+                                push_gear_to_classes(proto, slot, reqLstep, { BOT_CLASS_SPHYNX, BOT_CLASS_CRYPT_LORD });
+                                break;
+                            case ItemSubclassArmor::ITEM_SUBCLASS_ARMOR_PLATE:
+                                if (!is_caster_item)
+                                    push_gear_to_classes(proto, slot, reqLstep, { BOT_CLASS_WARRIOR, BOT_CLASS_DEATH_KNIGHT, BOT_CLASS_BM, BOT_CLASS_SPELLBREAKER });
+                                if (is_caster_item || proto.RequiredLevel < 60 || (proto.RequiredLevel < 78 && (proto.RandomProperty || proto.RandomSuffix)))
+                                    push_gear_to_classes(proto, slot, reqLstep, { BOT_CLASS_PALADIN, BOT_CLASS_SPHYNX, BOT_CLASS_DREADLORD, BOT_CLASS_CRYPT_LORD });
+                                break;
+                            default:
+                                break;
+                        }
+                        break;
+                    }
+                    default:
+                        break;
+                }
+                break;
+            case ITEM_CLASS_WEAPON:
+                if (proto.Damage[0].DamageMin < 1.0f || proto.Damage[0].DamageMax < 2.0f || proto.Delay < 1000)
+                    break;
+                if (proto.RequiredLevel > 75 && proto.Quality < ITEM_QUALITY_EPIC)
+                    break;
+                switch (proto.SubClass)
+                {
+                    case ItemSubclassWeapon::ITEM_SUBCLASS_WEAPON_WAND:
+                        if (proto.InventoryType != INVTYPE_RANGED && proto.InventoryType != INVTYPE_RANGEDRIGHT)
+                            break;
+                        push_gear_to_classes(proto, BOT_SLOT_MAINHAND, reqLstep, { BOT_CLASS_SPHYNX });
+                        push_gear_to_classes(proto, BOT_SLOT_OFFHAND, reqLstep, { BOT_CLASS_SPHYNX });
+                        push_gear_to_classes(proto, BOT_SLOT_RANGED, reqLstep, { BOT_CLASS_PRIEST, BOT_CLASS_MAGE, BOT_CLASS_WARLOCK });
+                        break;
+                    case ItemSubclassWeapon::ITEM_SUBCLASS_WEAPON_GUN:
+                    case ItemSubclassWeapon::ITEM_SUBCLASS_WEAPON_CROSSBOW:
+                        if (proto.InventoryType != INVTYPE_RANGED && proto.InventoryType != INVTYPE_RANGEDRIGHT)
+                            break;
+                        push_gear_to_classes(proto, BOT_SLOT_RANGED, reqLstep, { BOT_CLASS_WARRIOR, BOT_CLASS_ROGUE, BOT_CLASS_HUNTER });
+                        break;
+                    case ItemSubclassWeapon::ITEM_SUBCLASS_WEAPON_BOW:
+                        if (proto.InventoryType != INVTYPE_RANGED && proto.InventoryType != INVTYPE_RANGEDRIGHT)
+                            break;
+                        push_gear_to_classes(proto, BOT_SLOT_RANGED, reqLstep, { BOT_CLASS_WARRIOR, BOT_CLASS_ROGUE, BOT_CLASS_HUNTER, BOT_CLASS_DARK_RANGER, BOT_CLASS_SEA_WITCH });
+                        break;
+                    case ItemSubclassWeapon::ITEM_SUBCLASS_WEAPON_THROWN:
+                        if (proto.InventoryType != INVTYPE_THROWN)
+                            break;
+                        push_gear_to_classes(proto, BOT_SLOT_RANGED, reqLstep, { BOT_CLASS_WARRIOR, BOT_CLASS_ROGUE });
+                        break;
+                    case ItemSubclassWeapon::ITEM_SUBCLASS_WEAPON_STAFF:
+                        if (proto.InventoryType != INVTYPE_2HWEAPON)
+                            break;
+                        if (is_caster_item || proto.RequiredLevel < 50)
+                            push_gear_to_classes(proto, BOT_SLOT_MAINHAND, reqLstep, { BOT_CLASS_PRIEST, BOT_CLASS_MAGE, BOT_CLASS_WARLOCK, BOT_CLASS_DRUID, BOT_CLASS_SHAMAN, BOT_CLASS_ARCHMAGE, BOT_CLASS_NECROMANCER, BOT_CLASS_DREADLORD, BOT_CLASS_CRYPT_LORD });
+                        break;
+                    case ItemSubclassWeapon::ITEM_SUBCLASS_WEAPON_AXE2:
+                        if (proto.InventoryType != INVTYPE_2HWEAPON)
+                            break;
+                        if (!is_caster_item)
+                        {
+                            push_gear_to_classes(proto, BOT_SLOT_MAINHAND, reqLstep, { BOT_CLASS_WARRIOR, BOT_CLASS_PALADIN, BOT_CLASS_DEATH_KNIGHT, BOT_CLASS_BM });
+                            if (proto.RequiredLevel >= 60 - ITEM_SORTING_LEVEL_STEP)
+                                push_gear_to_classes(proto, BOT_SLOT_OFFHAND, reqLstep, { BOT_CLASS_WARRIOR });
+                        }
+                        push_gear_to_classes(proto, BOT_SLOT_MAINHAND, reqLstep, { BOT_CLASS_HUNTER, BOT_CLASS_SHAMAN, BOT_CLASS_DREADLORD, BOT_CLASS_CRYPT_LORD });
+                        break;
+                    case ItemSubclassWeapon::ITEM_SUBCLASS_WEAPON_SWORD2:
+                        if (proto.InventoryType != INVTYPE_2HWEAPON)
+                            break;
+                        if (!is_caster_item)
+                        {
+                            push_gear_to_classes(proto, BOT_SLOT_MAINHAND, reqLstep, { BOT_CLASS_WARRIOR, BOT_CLASS_PALADIN, BOT_CLASS_DEATH_KNIGHT, BOT_CLASS_BM });
+                            if (proto.RequiredLevel >= 60 - ITEM_SORTING_LEVEL_STEP)
+                                push_gear_to_classes(proto, BOT_SLOT_OFFHAND, reqLstep, { BOT_CLASS_WARRIOR });
+                        }
+                        push_gear_to_classes(proto, BOT_SLOT_MAINHAND, reqLstep, { BOT_CLASS_HUNTER, BOT_CLASS_DREADLORD, BOT_CLASS_CRYPT_LORD });
+                        break;
+                    case ItemSubclassWeapon::ITEM_SUBCLASS_WEAPON_POLEARM:
+                        if (proto.InventoryType != INVTYPE_2HWEAPON)
+                            break;
+                        if (!is_caster_item)
+                            push_gear_to_classes(proto, BOT_SLOT_MAINHAND, reqLstep, { BOT_CLASS_WARRIOR, BOT_CLASS_PALADIN, BOT_CLASS_DEATH_KNIGHT, BOT_CLASS_BM });
+                        push_gear_to_classes(proto, BOT_SLOT_MAINHAND, reqLstep, { BOT_CLASS_DRUID, BOT_CLASS_HUNTER, BOT_CLASS_DREADLORD, BOT_CLASS_CRYPT_LORD });
+                        break;
+                    case ItemSubclassWeapon::ITEM_SUBCLASS_WEAPON_MACE2:
+                        if (proto.InventoryType != INVTYPE_2HWEAPON)
+                            break;
+                        if (!is_caster_item)
+                        {
+                            push_gear_to_classes(proto, BOT_SLOT_MAINHAND, reqLstep, { BOT_CLASS_WARRIOR, BOT_CLASS_PALADIN, BOT_CLASS_HUNTER, BOT_CLASS_DEATH_KNIGHT });
+                            if (proto.RequiredLevel >= 60 - ITEM_SORTING_LEVEL_STEP)
+                                push_gear_to_classes(proto, BOT_SLOT_OFFHAND, reqLstep, { BOT_CLASS_WARRIOR });
+                        }
+                        push_gear_to_classes(proto, BOT_SLOT_MAINHAND, reqLstep, { BOT_CLASS_DRUID, BOT_CLASS_DREADLORD, BOT_CLASS_CRYPT_LORD });
+                        break;
+                    case ItemSubclassWeapon::ITEM_SUBCLASS_WEAPON_AXE:
+                        if (proto.InventoryType == INVTYPE_WEAPON || proto.InventoryType == INVTYPE_WEAPONMAINHAND)
+                        {
+                            if (!is_caster_item)
+                            {
+                                push_gear_to_classes(proto, BOT_SLOT_MAINHAND, reqLstep, { BOT_CLASS_WARRIOR });
+                                push_gear_to_classes(proto, BOT_SLOT_MAINHAND, reqLstep, { BOT_CLASS_ROGUE, BOT_CLASS_SPELLBREAKER });
+                            }
+                            push_gear_to_classes(proto, BOT_SLOT_MAINHAND, reqLstep, { BOT_CLASS_PALADIN, BOT_CLASS_SHAMAN });
+                        }
+                        if (proto.InventoryType == INVTYPE_WEAPON || proto.InventoryType == INVTYPE_WEAPONOFFHAND)
+                        {
+                            if (!is_caster_item)
+                            {
+                                if (proto.RequiredLevel < 60 - ITEM_SORTING_LEVEL_STEP)
+                                    push_gear_to_classes(proto, BOT_SLOT_OFFHAND, reqLstep, { BOT_CLASS_WARRIOR });
+                                push_gear_to_classes(proto, BOT_SLOT_OFFHAND, reqLstep, { BOT_CLASS_ROGUE });
+                            }
+                            push_gear_to_classes(proto, BOT_SLOT_OFFHAND, reqLstep, { BOT_CLASS_SHAMAN });
+                        }
+                        break;
+                    case ItemSubclassWeapon::ITEM_SUBCLASS_WEAPON_MACE:
+                        if (proto.InventoryType == INVTYPE_WEAPON || proto.InventoryType == INVTYPE_WEAPONMAINHAND)
+                        {
+                            if (!is_caster_item)
+                            {
+                                push_gear_to_classes(proto, BOT_SLOT_MAINHAND, reqLstep, { BOT_CLASS_WARRIOR });
+                                push_gear_to_classes(proto, BOT_SLOT_MAINHAND, reqLstep, { BOT_CLASS_ROGUE, BOT_CLASS_SPELLBREAKER });
+                            }
+                            push_gear_to_classes(proto, BOT_SLOT_MAINHAND, reqLstep, { BOT_CLASS_PALADIN, BOT_CLASS_SHAMAN });
+                            if (is_caster_item || proto.RequiredLevel < 55 || (proto.RequiredLevel < 78 && (proto.RandomProperty || proto.RandomSuffix)))
+                                push_gear_to_classes(proto, BOT_SLOT_MAINHAND, reqLstep, { BOT_CLASS_DRUID, BOT_CLASS_PRIEST });
+                        }
+                        if (proto.InventoryType == INVTYPE_WEAPON || proto.InventoryType == INVTYPE_WEAPONOFFHAND)
+                        {
+                            if (!is_caster_item)
+                            {
+                                if (proto.RequiredLevel < 60 - ITEM_SORTING_LEVEL_STEP)
+                                    push_gear_to_classes(proto, BOT_SLOT_OFFHAND, reqLstep, { BOT_CLASS_WARRIOR });
+                                push_gear_to_classes(proto, BOT_SLOT_OFFHAND, reqLstep, { BOT_CLASS_ROGUE });
+                            }
+                            push_gear_to_classes(proto, BOT_SLOT_OFFHAND, reqLstep, { BOT_CLASS_SHAMAN });
+                        }
+                        break;
+                    case ItemSubclassWeapon::ITEM_SUBCLASS_WEAPON_SWORD:
+                        if (proto.InventoryType == INVTYPE_WEAPON || proto.InventoryType == INVTYPE_WEAPONMAINHAND)
+                        {
+                            if (!is_caster_item)
+                            {
+                                push_gear_to_classes(proto, BOT_SLOT_MAINHAND, reqLstep, { BOT_CLASS_WARRIOR });
+                                push_gear_to_classes(proto, BOT_SLOT_MAINHAND, reqLstep, { BOT_CLASS_ROGUE, BOT_CLASS_SPELLBREAKER, BOT_CLASS_DARK_RANGER });
+                            }
+                            push_gear_to_classes(proto, BOT_SLOT_MAINHAND, reqLstep, { BOT_CLASS_PALADIN });
+                            if (is_caster_item || proto.RequiredLevel < 55 || (proto.RequiredLevel < 78 && (proto.RandomProperty || proto.RandomSuffix)))
+                                push_gear_to_classes(proto, BOT_SLOT_MAINHAND, reqLstep, { BOT_CLASS_MAGE, BOT_CLASS_WARLOCK });
+                        }
+                        if (proto.InventoryType == INVTYPE_WEAPON || proto.InventoryType == INVTYPE_WEAPONOFFHAND)
+                        {
+                            if (!is_caster_item)
+                            {
+                                if (proto.RequiredLevel < 60 - ITEM_SORTING_LEVEL_STEP)
+                                    push_gear_to_classes(proto, BOT_SLOT_OFFHAND, reqLstep, { BOT_CLASS_WARRIOR });
+                                push_gear_to_classes(proto, BOT_SLOT_OFFHAND, reqLstep, { BOT_CLASS_ROGUE, BOT_CLASS_DARK_RANGER });
+                            }
+                        }
+                        break;
+                    case ItemSubclassWeapon::ITEM_SUBCLASS_WEAPON_FIST:
+                        if (proto.InventoryType == INVTYPE_WEAPON || proto.InventoryType == INVTYPE_WEAPONMAINHAND)
+                        {
+                            if (!is_caster_item)
+                            {
+                                push_gear_to_classes(proto, BOT_SLOT_MAINHAND, reqLstep, { BOT_CLASS_WARRIOR });
+                                push_gear_to_classes(proto, BOT_SLOT_MAINHAND, reqLstep, { BOT_CLASS_SHAMAN, BOT_CLASS_ROGUE, BOT_CLASS_SPELLBREAKER });
+                            }
+                        }
+                        if (proto.InventoryType == INVTYPE_WEAPON || proto.InventoryType == INVTYPE_WEAPONOFFHAND)
+                        {
+                            if (!is_caster_item)
+                            {
+                                if (proto.RequiredLevel < 60 - ITEM_SORTING_LEVEL_STEP)
+                                    push_gear_to_classes(proto, BOT_SLOT_OFFHAND, reqLstep, { BOT_CLASS_WARRIOR });
+                                push_gear_to_classes(proto, BOT_SLOT_OFFHAND, reqLstep, { BOT_CLASS_SHAMAN, BOT_CLASS_ROGUE });
+                            }
+                        }
+                        break;
+                    case ItemSubclassWeapon::ITEM_SUBCLASS_WEAPON_DAGGER:
+                        if (proto.InventoryType == INVTYPE_WEAPON || proto.InventoryType == INVTYPE_WEAPONMAINHAND)
+                        {
+                            if (!is_caster_item)
+                            {
+                                if (proto.RequiredLevel < 60 - ITEM_SORTING_LEVEL_STEP)
+                                    push_gear_to_classes(proto, BOT_SLOT_MAINHAND, reqLstep, { BOT_CLASS_WARRIOR });
+                                push_gear_to_classes(proto, BOT_SLOT_MAINHAND, reqLstep, { BOT_CLASS_ROGUE, BOT_CLASS_SPELLBREAKER, BOT_CLASS_DARK_RANGER });
+                            }
+                            push_gear_to_classes(proto, BOT_SLOT_MAINHAND, reqLstep, { BOT_CLASS_SHAMAN });
+                            if (is_caster_item || proto.RequiredLevel < 55 || (proto.RequiredLevel < 78 && (proto.RandomProperty || proto.RandomSuffix)))
+                                push_gear_to_classes(proto, BOT_SLOT_MAINHAND, reqLstep, { BOT_CLASS_PRIEST, BOT_CLASS_MAGE, BOT_CLASS_WARLOCK, BOT_CLASS_DRUID, BOT_CLASS_SEA_WITCH });
+                        }
+                        if (proto.InventoryType == INVTYPE_WEAPON || proto.InventoryType == INVTYPE_WEAPONOFFHAND)
+                        {
+                            if (!is_caster_item)
+                            {
+                                if (proto.RequiredLevel < 60 - ITEM_SORTING_LEVEL_STEP)
+                                    push_gear_to_classes(proto, BOT_SLOT_OFFHAND, reqLstep, { BOT_CLASS_WARRIOR });
+                                push_gear_to_classes(proto, BOT_SLOT_OFFHAND, reqLstep, { BOT_CLASS_ROGUE, BOT_CLASS_DARK_RANGER });
+                            }
+                            push_gear_to_classes(proto, BOT_SLOT_OFFHAND, reqLstep, { BOT_CLASS_SHAMAN, BOT_CLASS_SEA_WITCH });
+                        }
+                        break;
+                    default:
+                        break;
+                }
+                break;
+            default:
+                break;
+        }
     }
 
-    CharacterDatabase.PExecute("UPDATE worldstates SET value = %u WHERE entry = %u", bot_id, uint32(BOT_GIVER_ENTRY));
+    for (uint32 c = BOT_CLASS_WARRIOR; c < BOT_CLASS_END; ++c)
+    {
+        if (c == 10)
+            continue;
+        ItemPerSlot const& ips_arr = _botsWanderCreaturesSortedGear.at(c);
+        for (uint32 s = BOT_SLOT_MAINHAND; s < BOT_INVENTORY_SIZE; ++s)
+        {
+            if (s == BOT_SLOT_FINGER2 || s == BOT_SLOT_TRINKET1 || s == BOT_SLOT_TRINKET2 || s == BOT_SLOT_BODY)
+                continue;
+            if ((s == BOT_SLOT_FINGER1 || s == BOT_SLOT_NECK || s == BOT_SLOT_BACK) && c == BOT_CLASS_SPHYNX)
+                continue;
+            if (s == BOT_SLOT_RANGED && !(c == BOT_CLASS_HUNTER || c == BOT_CLASS_ROGUE || c == BOT_CLASS_WARRIOR || c == BOT_CLASS_PRIEST ||
+                c == BOT_CLASS_MAGE || c == BOT_CLASS_WARLOCK || c == BOT_CLASS_DARK_RANGER || c == BOT_CLASS_SEA_WITCH))
+                continue;
+            ItemLeveledArr const& il_arr = ips_arr[s];
+            for (uint32 lstep = 0; lstep < LEVEL_STEPS; ++lstep)
+            {
+                if ((s == BOT_SLOT_SHOULDERS || s == BOT_SLOT_FINGER1 || s == BOT_SLOT_NECK) && lstep < 4)
+                    continue;
+                if ((s == BOT_SLOT_HEAD || s == BOT_SLOT_TRINKET1) && lstep < 6)
+                    continue;
+                if (s == BOT_SLOT_OFFHAND &&
+                    (lstep < 3 || c == BOT_CLASS_PALADIN || c == BOT_CLASS_HUNTER || c == BOT_CLASS_DEATH_KNIGHT || c == BOT_CLASS_BM || c == BOT_CLASS_ARCHMAGE ||
+                        c == BOT_CLASS_SPHYNX || c == BOT_CLASS_DREADLORD || c == BOT_CLASS_NECROMANCER || c == BOT_CLASS_CRYPT_LORD))
+                    continue;
+                if ((c == BOT_CLASS_DREADLORD || c == BOT_CLASS_DEATH_KNIGHT) && lstep < 8)
+                    continue;
+                if (il_arr[lstep].empty())
+                {
+                    uint32 minlvl = std::max<uint32>(lstep * ITEM_SORTING_LEVEL_STEP, 1);
+                    uint32 maxlvl = (lstep + 1) * ITEM_SORTING_LEVEL_STEP - 1;
+                    TC_LOG_WARN("server.loading", "No items for class {} slot {} at levels {}-{}!", c, s, minlvl, maxlvl);
+                }
+            }
+        }
+    }
 
-    TC_LOG_INFO("server.loading", ">> Spawned %u wandering bots in %u grids in %u ms",
-        uint32(_botsWanderCreatureTemplates.size()), uint32(botgrids.size()), GetMSTimeDiffToNow(oldMSTime));
+    TC_LOG_INFO("server.loading", ">> Sorted wandering bots gear in {} ms", GetMSTimeDiffToNow(oldMSTime));
+}
+
+Item* BotDataMgr::GenerateWanderingBotItem(uint8 slot, uint8 botclass, uint8 level, std::function<bool(ItemTemplate const*)>&& check)
+{
+    ASSERT(slot < BOT_INVENTORY_SIZE);
+    ASSERT(botclass < BOT_CLASS_END);
+    ASSERT(level <= DEFAULT_MAX_LEVEL + 4);
+
+    uint8 lvl = level;
+    ItemIdVector const* itemIdVec = &_botsWanderCreaturesSortedGear[botclass][slot][lvl / ITEM_SORTING_LEVEL_STEP];
+
+    while (itemIdVec->empty() && lvl > ITEM_SORTING_LEVEL_STEP)
+    {
+        lvl -= ITEM_SORTING_LEVEL_STEP;
+        itemIdVec = &_botsWanderCreaturesSortedGear[botclass][slot][lvl / ITEM_SORTING_LEVEL_STEP];
+    }
+
+    if (!itemIdVec->empty())
+    {
+        ItemIdVector validVec;
+        validVec.reserve(itemIdVec->size());
+        for (uint32 iid : *itemIdVec)
+        {
+            ItemTemplate const* proto = sObjectMgr->GetItemTemplate(iid);
+            if (check(proto))
+                validVec.push_back(iid);
+        }
+
+        if (!validVec.empty())
+        {
+            uint32 itemId = Trinity::Containers::SelectRandomContainerElement(validVec);
+            if (Item* newItem = Item::CreateItem(itemId, 1, nullptr))
+            {
+                if (uint32 randomPropertyId = GenerateItemRandomPropertyId(itemId))
+                    newItem->SetItemRandomProperties(randomPropertyId);
+
+                return newItem;
+            }
+        }
+    }
+
+    return nullptr;
+}
+
+bool BotDataMgr::GenerateWanderingBotItemEnchants(Item* item, uint8 slot, uint8 spec)
+{
+    bool result = false;
+
+    switch (slot)
+    {
+        case BOT_SLOT_BODY:
+        case BOT_SLOT_TRINKET1:
+        case BOT_SLOT_TRINKET2:
+            return result;
+        default:
+            break;
+    }
+
+    ItemTemplate const* proto = item->GetTemplate();
+
+    if (proto->RequiredLevel < 60)
+        return result;
+
+    static const auto is_enchantable = [](ItemTemplate const* p, SpellInfo const* s) {
+        SpellEffectInfo const& e = s->GetEffect(EFFECT_0);
+        return e.Effect == SPELL_EFFECT_ENCHANT_ITEM && s->EquippedItemClass == int32(p->Class) && s->BaseLevel <= p->RequiredLevel && e.MiscValue > 0 &&
+            (s->EquippedItemClass == ITEM_CLASS_WEAPON ? !!(s->EquippedItemSubClassMask & (1 << p->SubClass)) : !!(s->EquippedItemInventoryTypeMask & (1 << p->InventoryType))) &&
+            sSpellItemEnchantmentStore.LookupEntry(uint32(e.MiscValue));
+    };
+
+    constexpr std::array<uint32, 10> weapon_enchants_dk{ 53323, 53331, 53341, 53342, 53343, 53344, 53346, 53347, 62158, 70164 }; //2h only
+    constexpr std::array<uint32, 11> weapon_enchants_caster{ 27968, 27975, 28003, 34010, 44510, 44629, 59619, 59625, 60714, 62948, 62959 };
+    constexpr std::array<uint32, 18> weapon_enchants_melee{ 27971, 27977, 27984, 28004, 42620, 42974, 44524, 44576, 44630, 44633, 46578, 55836, 59619, 59621, 60621, 60691, 60707, 62257 };
+    constexpr std::array<uint32, 34> armor_enchants_caster{ 34003, 34008, 44383, 44488, 44492, 44528, 44555, 44582, 44592, 44612, 44616, 44623, 44635, 47898, 47900, 47901, 57690, 57691, 59636, 59784, 59970, 60609, 60653, 60692, 60767, 61120, 61271, 62256, 60583, 50911, 55016, 55634, 55642, 56034 };
+    constexpr std::array<uint32, 40> armor_enchants_melee{ 34007, 34008, 34009, 44383, 44484, 44488, 44492, 44500, 44513, 44528, 44529, 44575, 44589, 44598, 44612, 44616, 44623, 47898, 47900, 47901, 59777, 59954, 60606, 60609, 60616, 60623, 60663, 60668, 60692, 60763, 61271, 62256, 50903, 50911, 55016, 55777, 57690, 61117, 62201, 59636 };
+
+    //enchants
+    SpellInfo const* sInfo;
+    std::vector<uint32> valid_enchant_ids;
+    valid_enchant_ids.reserve(1u << 6);
+    switch (spec)
+    {
+        case BOT_SPEC_PALADIN_HOLY:
+        case BOT_SPEC_PRIEST_DISCIPLINE:
+        case BOT_SPEC_PRIEST_HOLY:
+        case BOT_SPEC_PRIEST_SHADOW:
+        case BOT_SPEC_SHAMAN_ELEMENTAL:
+        case BOT_SPEC_SHAMAN_RESTORATION:
+        case BOT_SPEC_MAGE_ARCANE:
+        case BOT_SPEC_MAGE_FIRE:
+        case BOT_SPEC_MAGE_FROST:
+        case BOT_SPEC_WARLOCK_AFFLICTION:
+        case BOT_SPEC_WARLOCK_DEMONOLOGY:
+        case BOT_SPEC_WARLOCK_DESTRUCTION:
+        case BOT_SPEC_DRUID_BALANCE:
+        case BOT_SPEC_DRUID_RESTORATION:
+            switch (proto->Class)
+            {
+                case ITEM_CLASS_WEAPON:
+                    for (uint32 spellId : weapon_enchants_caster)
+                    {
+                        sInfo = sSpellMgr->AssertSpellInfo(spellId);
+                        if (is_enchantable(proto, sInfo))
+                            valid_enchant_ids.push_back(uint32(sInfo->GetEffect(EFFECT_0).MiscValue));
+                    }
+                    break;
+                case ITEM_CLASS_ARMOR:
+                    for (uint32 spellId : armor_enchants_caster)
+                    {
+                        sInfo = sSpellMgr->AssertSpellInfo(spellId);
+                        if (is_enchantable(proto, sInfo))
+                            valid_enchant_ids.push_back(uint32(sInfo->GetEffect(EFFECT_0).MiscValue));
+                    }
+                    break;
+                default:
+                    break;
+            }
+            break;
+        case BOT_SPEC_DK_BLOOD:
+        case BOT_SPEC_DK_FROST:
+        case BOT_SPEC_DK_UNHOLY:
+            switch (proto->Class)
+            {
+                case ITEM_CLASS_WEAPON:
+                    for (uint32 spellId : weapon_enchants_dk)
+                    {
+                        sInfo = sSpellMgr->AssertSpellInfo(spellId);
+                        if (is_enchantable(proto, sInfo))
+                            valid_enchant_ids.push_back(uint32(sInfo->GetEffect(EFFECT_0).MiscValue));
+                    }
+                    break;
+                default:
+                    break;
+            }
+        [[fallthrough]];
+        case BOT_SPEC_WARRIOR_ARMS:
+        case BOT_SPEC_WARRIOR_FURY:
+        case BOT_SPEC_WARRIOR_PROTECTION:
+        case BOT_SPEC_PALADIN_PROTECTION:
+        case BOT_SPEC_PALADIN_RETRIBUTION:
+        case BOT_SPEC_HUNTER_BEASTMASTERY:
+        case BOT_SPEC_HUNTER_MARKSMANSHIP:
+        case BOT_SPEC_HUNTER_SURVIVAL:
+        case BOT_SPEC_ROGUE_ASSASINATION:
+        case BOT_SPEC_ROGUE_COMBAT:
+        case BOT_SPEC_ROGUE_SUBTLETY:
+        case BOT_SPEC_SHAMAN_ENHANCEMENT:
+        case BOT_SPEC_DRUID_FERAL:
+            switch (proto->Class)
+            {
+                case ITEM_CLASS_WEAPON:
+                    for (uint32 spellId : weapon_enchants_melee)
+                    {
+                        sInfo = sSpellMgr->AssertSpellInfo(spellId);
+                        if (is_enchantable(proto, sInfo))
+                            valid_enchant_ids.push_back(uint32(sInfo->GetEffect(EFFECT_0).MiscValue));
+                    }
+                    break;
+                case ITEM_CLASS_ARMOR:
+                    for (uint32 spellId : armor_enchants_melee)
+                    {
+                        sInfo = sSpellMgr->AssertSpellInfo(spellId);
+                        if (is_enchantable(proto, sInfo))
+                            valid_enchant_ids.push_back(uint32(sInfo->GetEffect(EFFECT_0).MiscValue));
+                    }
+                    break;
+                default:
+                    break;
+            }
+            break;
+        default:
+            break;
+    }
+
+    uint32 enchant_id;
+    enchant_id = valid_enchant_ids.empty() ? 0 : valid_enchant_ids.size() == 1u ? valid_enchant_ids.front() : Trinity::Containers::SelectRandomContainerElement(valid_enchant_ids);
+    if (enchant_id)
+    {
+        item->SetUInt32Value(ITEM_FIELD_ENCHANTMENT_1_1 + PERM_ENCHANTMENT_SLOT*MAX_ENCHANTMENT_OFFSET + ENCHANTMENT_ID_OFFSET, enchant_id);
+        item->SetUInt32Value(ITEM_FIELD_ENCHANTMENT_1_1 + PERM_ENCHANTMENT_SLOT*MAX_ENCHANTMENT_OFFSET + ENCHANTMENT_DURATION_OFFSET, 0);
+        item->SetUInt32Value(ITEM_FIELD_ENCHANTMENT_1_1 + PERM_ENCHANTMENT_SLOT*MAX_ENCHANTMENT_OFFSET + ENCHANTMENT_CHARGES_OFFSET, 0);
+        result = true;
+    }
+
+    //gems
+    constexpr std::array<uint32, 5> gems_caster{ 40132, 40135, 40123, 40127, 40128 };
+    constexpr std::array<uint32, 6> gems_melee{ 40136, 40140, 40124, 40125, 40127, 40128 };
+
+    for (uint8 i = 0; i < MAX_ITEM_PROTO_SOCKETS; ++i)
+    {
+        valid_enchant_ids.clear();
+        switch (spec)
+        {
+            case BOT_SPEC_PALADIN_HOLY:
+            case BOT_SPEC_PRIEST_DISCIPLINE:
+            case BOT_SPEC_PRIEST_HOLY:
+            case BOT_SPEC_PRIEST_SHADOW:
+            case BOT_SPEC_SHAMAN_ELEMENTAL:
+            case BOT_SPEC_SHAMAN_RESTORATION:
+            case BOT_SPEC_MAGE_ARCANE:
+            case BOT_SPEC_MAGE_FIRE:
+            case BOT_SPEC_MAGE_FROST:
+            case BOT_SPEC_WARLOCK_AFFLICTION:
+            case BOT_SPEC_WARLOCK_DEMONOLOGY:
+            case BOT_SPEC_WARLOCK_DESTRUCTION:
+            case BOT_SPEC_DRUID_BALANCE:
+            case BOT_SPEC_DRUID_RESTORATION:
+                for (uint32 gId : gems_caster)
+                {
+                    GemPropertiesEntry const* gprops = sGemPropertiesStore.LookupEntry(sObjectMgr->GetItemTemplate(gId)->GemProperties);
+                    if (gprops->Type & proto->Socket[i].Color)
+                        valid_enchant_ids.push_back(gprops->EnchantID);
+                }
+                break;
+            case BOT_SPEC_DK_BLOOD:
+            case BOT_SPEC_DK_FROST:
+            case BOT_SPEC_DK_UNHOLY:
+            case BOT_SPEC_WARRIOR_ARMS:
+            case BOT_SPEC_WARRIOR_FURY:
+            case BOT_SPEC_WARRIOR_PROTECTION:
+            case BOT_SPEC_PALADIN_PROTECTION:
+            case BOT_SPEC_PALADIN_RETRIBUTION:
+            case BOT_SPEC_HUNTER_BEASTMASTERY:
+            case BOT_SPEC_HUNTER_MARKSMANSHIP:
+            case BOT_SPEC_HUNTER_SURVIVAL:
+            case BOT_SPEC_ROGUE_ASSASINATION:
+            case BOT_SPEC_ROGUE_COMBAT:
+            case BOT_SPEC_ROGUE_SUBTLETY:
+            case BOT_SPEC_SHAMAN_ENHANCEMENT:
+            case BOT_SPEC_DRUID_FERAL:
+                for (uint32 gId : gems_melee)
+                {
+                    GemPropertiesEntry const* gprops = sGemPropertiesStore.LookupEntry(sObjectMgr->GetItemTemplate(gId)->GemProperties);
+                    if (gprops->Type & proto->Socket[i].Color)
+                        valid_enchant_ids.push_back(gprops->EnchantID);
+                }
+                break;
+            default:
+                break;
+        }
+
+        enchant_id = valid_enchant_ids.empty() ? 0 : valid_enchant_ids.size() == 1u ? valid_enchant_ids.front() : Trinity::Containers::SelectRandomContainerElement(valid_enchant_ids);
+        if (enchant_id)
+        {
+            item->SetUInt32Value(ITEM_FIELD_ENCHANTMENT_1_1 + (uint8(SOCK_ENCHANTMENT_SLOT) + i)*MAX_ENCHANTMENT_OFFSET + ENCHANTMENT_ID_OFFSET, enchant_id);
+            item->SetUInt32Value(ITEM_FIELD_ENCHANTMENT_1_1 + (uint8(SOCK_ENCHANTMENT_SLOT) + i)*MAX_ENCHANTMENT_OFFSET + ENCHANTMENT_DURATION_OFFSET, 0);
+            item->SetUInt32Value(ITEM_FIELD_ENCHANTMENT_1_1 + (uint8(SOCK_ENCHANTMENT_SLOT) + i)*MAX_ENCHANTMENT_OFFSET + ENCHANTMENT_CHARGES_OFFSET, 0);
+            result = true;
+        }
+    }
+
+    return result;
 }
 
 CreatureTemplate const* BotDataMgr::GetBotExtraCreatureTemplate(uint32 entry)
@@ -758,7 +2276,7 @@ void BotDataMgr::AddNpcBotData(uint32 entry, uint32 roles, uint8 spec, uint32 fa
         return;
     }
 
-    TC_LOG_ERROR("sql.sql", "BotMgr::AddNpcBotData(): trying to add new data but entry already exists! entry = %u", entry);
+    TC_LOG_ERROR("sql.sql", "BotMgr::AddNpcBotData(): trying to add new data but entry already exists! entry = {}", entry);
 }
 NpcBotData const* BotDataMgr::SelectNpcBotData(uint32 entry)
 {
@@ -923,7 +2441,7 @@ void BotDataMgr::UpdateNpcBotData(uint32 entry, NpcBotDataUpdateType updateType,
             break;
         }
         default:
-            TC_LOG_ERROR("sql.sql", "BotDataMgr:UpdateNpcBotData: unhandled updateType %u", uint32(updateType));
+            TC_LOG_ERROR("sql.sql", "BotDataMgr:UpdateNpcBotData: unhandled updateType {}", uint32(updateType));
             break;
     }
 }
@@ -950,7 +2468,7 @@ void BotDataMgr::UpdateNpcBotDataAll(uint32 playerGuid, NpcBotDataUpdateType upd
         //case NPCBOT_UPDATE_FACTION:
         //case NPCBOT_UPDATE_EQUIPS:
         default:
-            TC_LOG_ERROR("sql.sql", "BotDataMgr:UpdateNpcBotDataAll: unhandled updateType %u", uint32(updateType));
+            TC_LOG_ERROR("sql.sql", "BotDataMgr:UpdateNpcBotDataAll: unhandled updateType {}", uint32(updateType));
             break;
     }
 }
@@ -1013,7 +2531,7 @@ NpcBotTransmogData const* BotDataMgr::SelectNpcBotTransmogs(uint32 entry)
     NpcBotTransmogDataMap::const_iterator itr = _botsTransmogData.find(entry);
     return itr != _botsTransmogData.cend() ? itr->second : nullptr;
 }
-void BotDataMgr::UpdateNpcBotTransmogData(uint32 entry, uint8 slot, uint32 item_id, uint32 fake_id, bool update_db)
+void BotDataMgr::UpdateNpcBotTransmogData(uint32 entry, uint8 slot, uint32 item_id, int32 fake_id, bool update_db)
 {
     ASSERT(slot < BOT_TRANSMOG_INVENTORY_SIZE);
 
@@ -1030,7 +2548,7 @@ void BotDataMgr::UpdateNpcBotTransmogData(uint32 entry, uint8 slot, uint32 item_
         bstmt->setUInt32(0, entry);
         bstmt->setUInt8(1, slot);
         bstmt->setUInt32(2, item_id);
-        bstmt->setUInt32(3, fake_id);
+        bstmt->setInt32(3, fake_id);
         CharacterDatabase.Execute(bstmt);
     }
 }
@@ -1046,7 +2564,7 @@ void BotDataMgr::ResetNpcBotTransmogData(uint32 entry, bool update_db)
         CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
         for (uint8 i = 0; i != BOT_TRANSMOG_INVENTORY_SIZE; ++i)
         {
-            if (_botsTransmogData[entry]->transmogs[i].first == 0 && _botsTransmogData[entry]->transmogs[i].second == 0)
+            if (_botsTransmogData[entry]->transmogs[i].first == 0 && _botsTransmogData[entry]->transmogs[i].second == -1)
                 continue;
 
             CharacterDatabasePreparedStatement* bstmt = CharacterDatabase.GetPreparedStatement(CHAR_REP_NPCBOT_TRANSMOG);
@@ -1054,7 +2572,7 @@ void BotDataMgr::ResetNpcBotTransmogData(uint32 entry, bool update_db)
             bstmt->setUInt32(0, entry);
             bstmt->setUInt8(1, i);
             bstmt->setUInt32(2, 0);
-            bstmt->setUInt32(3, 0);
+            bstmt->setInt32(3, -1);
             trans->Append(bstmt);
         }
 
@@ -1063,36 +2581,36 @@ void BotDataMgr::ResetNpcBotTransmogData(uint32 entry, bool update_db)
     }
 
     for (uint8 i = 0; i != BOT_TRANSMOG_INVENTORY_SIZE; ++i)
-        _botsTransmogData[entry]->transmogs[i] = { 0, 0 };
+        _botsTransmogData[entry]->transmogs[i] = { 0, -1 };
 }
 
 void BotDataMgr::RegisterBot(Creature const* bot)
 {
     if (_existingBots.find(bot) != _existingBots.end())
     {
-        TC_LOG_ERROR("entities.unit", "BotDataMgr::RegisterBot: bot %u (%s) already registered!",
-            bot->GetEntry(), bot->GetName().c_str());
+        TC_LOG_ERROR("entities.unit", "BotDataMgr::RegisterBot: bot {} ({}) already registered!",
+            bot->GetEntry(), bot->GetName());
         return;
     }
 
     std::unique_lock<std::shared_mutex> lock(*GetLock());
 
     _existingBots.insert(bot);
-    //TC_LOG_ERROR("entities.unit", "BotDataMgr::RegisterBot: registered bot %u (%s)", bot->GetEntry(), bot->GetName().c_str());
+    //TC_LOG_ERROR("entities.unit", "BotDataMgr::RegisterBot: registered bot {} ({})", bot->GetEntry(), bot->GetName());
 }
 void BotDataMgr::UnregisterBot(Creature const* bot)
 {
     if (_existingBots.find(bot) == _existingBots.end())
     {
-        TC_LOG_ERROR("entities.unit", "BotDataMgr::UnregisterBot: bot %u (%s) not found!",
-            bot->GetEntry(), bot->GetName().c_str());
+        TC_LOG_ERROR("entities.unit", "BotDataMgr::UnregisterBot: bot {} ({}) not found!",
+            bot->GetEntry(), bot->GetName());
         return;
     }
 
     std::unique_lock<std::shared_mutex> lock(*GetLock());
 
     _existingBots.erase(bot);
-    //TC_LOG_ERROR("entities.unit", "BotDataMgr::UnregisterBot: unregistered bot %u (%s)", bot->GetEntry(), bot->GetName().c_str());
+    //TC_LOG_ERROR("entities.unit", "BotDataMgr::UnregisterBot: unregistered bot {} ({})", bot->GetEntry(), bot->GetName());
 }
 Creature const* BotDataMgr::FindBot(uint32 entry)
 {
@@ -1105,7 +2623,7 @@ Creature const* BotDataMgr::FindBot(uint32 entry)
     }
     return nullptr;
 }
-Creature const* BotDataMgr::FindBot(std::string_view name, LocaleConstant loc)
+Creature const* BotDataMgr::FindBot(std::string_view name, LocaleConstant loc, std::vector<uint32> const* not_ids)
 {
     std::wstring wname;
     if (Utf8toWStr(name, wname))
@@ -1114,6 +2632,9 @@ Creature const* BotDataMgr::FindBot(std::string_view name, LocaleConstant loc)
         std::shared_lock<std::shared_mutex> lock(*GetLock());
         for (NpcBotRegistry::const_iterator ci = _existingBots.cbegin(); ci != _existingBots.cend(); ++ci)
         {
+            if (not_ids && std::find(not_ids->cbegin(), not_ids->cend(), (*ci)->GetEntry()) != not_ids->cend())
+                continue;
+
             std::string basename = (*ci)->GetName();
             if (CreatureLocale const* creatureInfo = sObjectMgr->GetCreatureLocale((*ci)->GetEntry()))
             {
@@ -1204,8 +2725,31 @@ uint8 BotDataMgr::GetLevelBonusForBotRank(uint32 rank)
     }
 }
 
+uint8 BotDataMgr::GetMinLevelForMapId(uint32 mapId)
+{
+    decltype(_wpMinSpawnLevelPerMapId)::const_iterator cit = _wpMinSpawnLevelPerMapId.find(mapId);
+    if (cit != _wpMinSpawnLevelPerMapId.cend())
+        return cit->second;
+
+    switch (mapId)
+    {
+        case 0:
+        case 1:
+            return 1;
+        case 530:
+            return 61;
+        case 571:
+            return 71;
+        default:
+            return 1;
+    }
+}
 uint8 BotDataMgr::GetMaxLevelForMapId(uint32 mapId)
 {
+    decltype(_wpMaxSpawnLevelPerMapId)::const_iterator cit = _wpMaxSpawnLevelPerMapId.find(mapId);
+    if (cit != _wpMaxSpawnLevelPerMapId.cend())
+        return cit->second;
+
     switch (mapId)
     {
         case 0:
@@ -1240,157 +2784,276 @@ uint8 BotDataMgr::GetMinLevelForBotClass(uint8 m_class)
     }
 }
 
-std::pair<uint8, uint8> BotDataMgr::GetZoneLevels(uint32 zoneId)
+int32 BotDataMgr::GetBotBaseReputation(Creature const* bot, FactionEntry const* factionEntry)
 {
-    //Only maps 0 and 1 are covered
-    switch (zoneId)
-    {
-        case 1: // Dun Morogh
-        case 12: // Elwynn Forest
-        case 14: // Durotar
-        case 85: // Tirisfal Glades
-        case 141: // Teldrassil
-        case 215: // Mulgore
-        case 3430: // Eversong Woods
-        case 3524: // Azuremyst Isle
-            return { 1, 12 };
-        case 38: // Loch Modan
-        case 40: // Westfall
-        case 130: // Silverpine Woods
-        case 148: // Darkshore
-        case 3433: // Ghostlands
-        case 3525: // Bloodmyst Isle
-            return { 8, 22 };
-        case 17: // Barrens
-        case 721: // Gnomeregan
-            return { 8, 28 };
-        case 44: // Redridge Mountains
-            return { 13, 28 };
-        case 406: // Stonetalon Mountains
-            return { 13, 30 };
-        case 10: // Duskwood
-        case 11: // Wetlands
-        case 267: // Hillsbrad Foothills
-        case 331: // Ashenvale
-            return { 18, 32 };
-        case 400: // Thousand Needles
-            return { 23, 38 };
-        case 36: // Alterac Mountains
-        case 45: // Arathi Highlands
-        case 405: // Desolace
-            return { 28, 42 };
-        case 33: // Stranglethorn Valley
-            return { 28, 48 };
-        case 3: // Badlands
-        case 8: // Swamp of Sorrows
-        case 15: // Dustwallow Marsh
-            return { 33, 48 };
-        case 47: // Hinterlands
-        case 357: // Feralas
-        case 440: // Tanaris
-            return { 38, 52 };
-        case 4: // Blasted Lands
-        case 16: // Azshara
-        case 51: // Searing Gorge
-            return { 43, 54 };
-        case 490: // Un'Goro Crater
-            return { 45, 56 };
-        case 361: // Felwood
-            return { 46, 56 };
-        case 28: // Western Plaguelands
-        case 46: // Burning Steppes
-            return { 48, 56 };
-        case 41: // Deadwind Pass
-            return { 50, 60 };
-        case 1377: // Silithus
-        case 2017: // Stratholme
-            return { 53, 60 };
-        case 139: // Eastern Plaguelands
-        case 618: // Winterspring
-            return { 53, 60 }; //63
-        default:
-            TC_LOG_ERROR("scripts", "GetZoneLevels: no choice for zoneId %u", zoneId);
-            return { 50, 60 };
-    }
-}
+    if (!factionEntry)
+        return 0;
 
-std::pair<uint32, Position const*> BotDataMgr::GetWanderMapNode(uint32 mapId, uint32 curNodeId, uint32 lastNodeId, uint8 lvl)
-{
-    decltype(WanderMap.Nodes)::const_iterator cit = WanderMap.Nodes.find(mapId);
-    if (cit != WanderMap.Nodes.cend())
+    if (bot->IsNPCBotPet())
+        bot = bot->GetBotPetAI()->GetPetsOwner();
+
+    uint32 raceMask = bot->GetFaction() == 14 ? 0 : bot->GetRaceMask();
+    uint32 classMask = bot->GetClassMask();
+
+    int32 minRep = 42999;
+    for (uint8 i = 0; i < 4; ++i)
     {
-        decltype(WanderMap.Nodes)::value_type::second_type::const_iterator ici = cit->second.find(curNodeId);
-        if (ici != cit->second.cend())
+        if (raceMask == 0)
+            minRep = std::min<int32>(minRep, factionEntry->ReputationBase[i]);
+        if ((factionEntry->ReputationRaceMask[i] & raceMask || (factionEntry->ReputationRaceMask[i] == 0 && factionEntry->ReputationClassMask[i] != 0)) &&
+            (factionEntry->ReputationClassMask[i] & classMask || factionEntry->ReputationClassMask[i] == 0))
         {
-            std::vector<decltype(WanderMap)::BotTravelNode const*> convec;
-            if (ici->second.connections.size() == 1)
-                convec.push_back(ici->second.connections.front());
-            else
-            {
-                uint8 minlevel = 255;
-                for (auto const* con : ici->second.connections)
-                {
-                    if (con->id != lastNodeId && lvl >= con->minlevel && lvl <= con->maxlevel + 3)
-                        convec.push_back(con);
-                    if (con->maxlevel < minlevel)
-                        minlevel = con->maxlevel;
-                }
-                if (convec.empty())
-                {
-                    for (auto const* con : ici->second.connections)
-                    {
-                        if (con->id != lastNodeId && con->maxlevel == minlevel)
-                            convec.push_back(con);
-                    }
-                }
-                if (convec.empty())
-                {
-                    for (auto const* con : ici->second.connections)
-                    {
-                        if (con->maxlevel == minlevel)
-                            convec.push_back(con);
-                    }
-                }
-                if (convec.empty())
-                {
-                    for (auto const* con : ici->second.connections)
-                    {
-                        if (con->id != lastNodeId)
-                            convec.push_back(con);
-                    }
-                }
-            }
-            ASSERT(!convec.empty());
-            auto* randomNode = (convec.size() == 1) ? convec.front() : Trinity::Containers::SelectRandomContainerElement(convec);
-            return std::make_pair(randomNode->id, static_cast<Position const*>(randomNode));
+            return factionEntry->ReputationBase[i];
         }
     }
 
-    return { 0, nullptr };
+    return std::min<int32>(minRep, 0);
 }
 
-Position const* BotDataMgr::GetWanderMapNodePosition(uint32 mapId, uint32 nodeId)
+TeamId BotDataMgr::GetTeamIdForFaction(uint32 factionTemplateId)
 {
-    decltype(WanderMap.Nodes)::const_iterator cit = WanderMap.Nodes.find(mapId);
-    if (cit != WanderMap.Nodes.cend())
+    if (FactionTemplateEntry const* fte = sFactionTemplateStore.LookupEntry(factionTemplateId))
     {
-        decltype(WanderMap.Nodes)::value_type::second_type::const_iterator ici = cit->second.find(nodeId);
-        if (ici != cit->second.cend())
-            return static_cast<Position const*>(&ici->second);
+        if (fte->FactionGroup & FACTION_MASK_ALLIANCE)
+            return TEAM_ALLIANCE;
+        else if (fte->FactionGroup & FACTION_MASK_HORDE)
+            return TEAM_HORDE;
     }
+
+    return TEAM_NEUTRAL;
+}
+
+uint32 BotDataMgr::GetTeamForFaction(uint32 factionTemplateId)
+{
+    switch (GetTeamIdForFaction(factionTemplateId))
+    {
+        case TEAM_ALLIANCE:
+            return ALLIANCE;
+        case TEAM_HORDE:
+            return HORDE;
+        default:
+            return TEAM_OTHER;
+    }
+}
+
+bool BotDataMgr::IsWanderNodeAvailableForBotFaction(WanderNode const* wp, uint32 factionTemplateId, bool teleport)
+{
+    if (!teleport)
+    {
+        if (wp->HasFlag(BotWPFlags::BOTWP_FLAG_MOVEMENT_IGNORES_FACTION))
+            return true;
+    }
+    else
+    {
+        MapEntry const* mapEntry = sMapStore.LookupEntry(wp->GetMapId());
+        if (!mapEntry->IsContinent())
+            return false;
+    }
+
+    switch (GetTeamIdForFaction(factionTemplateId))
+    {
+        case TEAM_ALLIANCE:
+            return !wp->HasFlag(BotWPFlags::BOTWP_FLAG_HORDE_ONLY);
+        case TEAM_HORDE:
+            return !wp->HasFlag(BotWPFlags::BOTWP_FLAG_ALLIANCE_ONLY);
+        case TEAM_NEUTRAL:
+            return !wp->HasFlag(BotWPFlags::BOTWP_FLAG_ALLIANCE_OR_HORDE_ONLY);
+        default:
+            return true;
+    }
+}
+
+WanderNode const* BotDataMgr::GetNextWanderNode(WanderNode const* curNode, WanderNode const* lastNode, Position const* fromPos, Creature const* bot, uint8 lvl, bool random)
+{
+    using NodeList = std::list<WanderNode const*>;
+
+    static auto node_viable = [](WanderNode const* wp, uint8 lvl) -> bool {
+        return (lvl + 2 >= wp->GetLevels().first && lvl <= wp->GetLevels().second);
+    };
+
+    uint32 faction = bot->GetFaction();
+
+    //Node got deleted (or forced)! Select close point and go from there
+    NodeList links;
+    if (curNode->GetLinks().empty() || random)
+    {
+        if (bot->IsInWorld() && !bot->GetMap()->IsBattlegroundOrArena())
+        {
+            WanderNode::DoForAllMapWPs(curNode->GetMapId(), [&links, lvl = lvl, fac = faction, pos = fromPos](WanderNode const* wp) {
+                if (pos->GetExactDist2d(wp) < MAX_WANDER_NODE_DISTANCE &&
+                    IsWanderNodeAvailableForBotFaction(wp, fac, true) && node_viable(wp, lvl))
+                    links.push_back(wp);
+            });
+            if (!links.empty())
+                return links.size() == 1u ? links.front() : Trinity::Containers::SelectRandomContainerElement(links);
+        }
+
+        //Select closest
+        WanderNode const* node_new = nullptr;
+        float mindist = 50000.0f; // Anywhere
+        WanderNode::DoForAllMapWPs(curNode->GetMapId(), [&node_new, &mindist, lvl = lvl, fac = faction, pos = fromPos](WanderNode const* wp) {
+            float dist = pos->GetExactDist2d(wp);
+            if (dist < mindist &&
+                IsWanderNodeAvailableForBotFaction(wp, fac, false) && node_viable(wp, lvl))
+            {
+                mindist = dist;
+                node_new = wp;
+            }
+        });
+        return node_new;
+    }
+
+    if (bot_ai::IsFlagCarrier(bot))
+    {
+        NodeList flagDropNodes;
+        TeamId teamId = GetTeamIdForFaction(faction);
+        static const auto is_my_flag_drop_node = [](WanderNode const* dwp, TeamId tId) {
+            if (dwp->HasFlag(BotWPFlags::BOTWP_FLAG_BG_FLAG_DELIVER_TARGET))
+            {
+                //must only select own faction drop node
+                return (!dwp->HasFlag(BotWPFlags::BOTWP_FLAG_ALLIANCE_OR_HORDE_ONLY) ||
+                    (tId == TEAM_ALLIANCE && dwp->HasFlag(BotWPFlags::BOTWP_FLAG_ALLIANCE_ONLY)) ||
+                    (tId == TEAM_HORDE && dwp->HasFlag(BotWPFlags::BOTWP_FLAG_HORDE_ONLY)));
+            }
+            return false;
+        };
+        //check two levels of links, enough for: WSG
+        for (WanderNode const* dwp : curNode->GetLinks())
+        {
+            if (is_my_flag_drop_node(dwp, teamId))
+                flagDropNodes.push_back(dwp);
+            else
+            {
+                for (WanderNode const* dwpl : dwp->GetLinks())
+                {
+                    if (dwpl != curNode && is_my_flag_drop_node(dwpl, teamId))
+                    {
+                        flagDropNodes.push_back(dwp);
+                        break;
+                    }
+                }
+            }
+        }
+        if (!flagDropNodes.empty())
+            return flagDropNodes.size() == 1u ? flagDropNodes.front() : Trinity::Containers::SelectRandomContainerElement(flagDropNodes);
+    }
+
+    for (WanderNode const* wp : curNode->GetLinks())
+    {
+        if (IsWanderNodeAvailableForBotFaction(wp, faction, false) && node_viable(wp, lvl))
+            links.push_back(wp);
+    }
+    if (links.size() > 1 && lastNode && !curNode->HasFlag(BotWPFlags::BOTWP_FLAG_CAN_BACKTRACK_FROM))
+        links.remove(lastNode);
+
+    //Overleveled or died: no viable nodes in reach, find one for teleport
+    if (links.empty())
+    {
+        WanderNode::DoForAllWPs([&links, lvl = lvl, fac = faction](WanderNode const* wp) {
+            if (IsWanderNodeAvailableForBotFaction(wp, fac, true) && wp->HasFlag(BotWPFlags::BOTWP_FLAG_SPAWN) && node_viable(wp, lvl))
+                links.push_back(wp);
+        });
+    }
+
+    ASSERT(!links.empty());
+    return links.size() == 1u ? links.front() : Trinity::Containers::SelectRandomContainerElement(links);
+}
+
+WanderNode const* BotDataMgr::GetClosestWanderNode(WorldLocation const* loc)
+{
+    float mindist = 50000.0f;
+    WanderNode const* closestNode = nullptr;
+    WanderNode::DoForAllMapWPs(loc->GetMapId(), [&mindist, &closestNode, loc = loc](WanderNode const* wp) {
+        float dist = wp->GetExactDist2d(loc);
+        if (dist < mindist)
+        {
+            mindist = dist;
+            closestNode = wp;
+        }
+    });
+
+    return closestNode;
+}
+
+BotBankItemContainer const* BotDataMgr::GetBotBankItems(ObjectGuid playerGuid)
+{
+    decltype(_botStoredGearMap)::iterator mci = _botStoredGearMap.find(playerGuid);
+    return mci == _botStoredGearMap.cend() ? nullptr : &mci->second;
+}
+
+Item* BotDataMgr::WithdrawBotBankItem(ObjectGuid playerGuid, ObjectGuid::LowType itemGuidLow)
+{
+    decltype(_botStoredGearMap)::iterator mci = _botStoredGearMap.find(playerGuid);
+    if (mci != _botStoredGearMap.cend())
+    {
+        auto ici = std::find_if(std::cbegin(mci->second), std::cend(mci->second), [guidLow = itemGuidLow](Item const* item) {
+            return item->GetGUID().GetCounter() == guidLow;
+        });
+        if (ici != mci->second.cend())
+        {
+            Item* item = *ici;
+            mci->second.erase(ici);
+            return item;
+        }
+    }
+
     return nullptr;
 }
 
-std::string BotDataMgr::GetWanderMapNodeName(uint32 mapId, uint32 nodeId)
+void BotDataMgr::DepositBotBankItem(ObjectGuid playerGuid, Item* item)
 {
-    decltype(WanderMap.Nodes)::const_iterator cit = WanderMap.Nodes.find(mapId);
-    if (cit != WanderMap.Nodes.cend())
+    _botStoredGearMap[playerGuid].insert(item);
+}
+
+void BotDataMgr::SaveNpcBotStoredGear(ObjectGuid playerGuid, CharacterDatabaseTransaction trans)
+{
+    decltype(_botStoredGearMap)::iterator mci = _botStoredGearMap.find(playerGuid);
+    // we don't check if container is empty!
+    // we have to be able to erase items always
+    if (mci == _botStoredGearMap.cend())
+        return;
+
+    trans->PAppend("DELETE FROM characters_npcbot_gear_storage WHERE guid = {}", mci->first.GetCounter());
+    for (Item* item : mci->second)
     {
-        decltype(WanderMap.Nodes)::value_type::second_type::const_iterator ici = cit->second.find(nodeId);
-        if (ici != cit->second.cend())
-            return ici->second.name;
+        //order is important here
+        item->SaveToDB(trans);
+        item->DeleteFromInventoryDB(trans);
+        trans->PAppend("INSERT INTO characters_npcbot_gear_storage (guid, item_guid) VALUES ({}, {})", mci->first.GetCounter(), item->GetGUID().GetCounter());
     }
-    return {};
+}
+
+class TC_GAME_API WanderingBotXpGainFormulaScript : public FormulaScript
+{
+    static constexpr float WANDERING_BOT_XP_GAIN_MULT = 10.0f;
+
+public:
+    WanderingBotXpGainFormulaScript() : FormulaScript("WanderingBotXpGainFormulaScript") {}
+
+    void OnGainCalculation(uint32& gain, Player* /*player*/, Unit* unit) override
+    {
+        if (gain && unit->IsNPCBot() && unit->ToCreature()->IsWandererBot())
+            gain *= WANDERING_BOT_XP_GAIN_MULT;
+    }
+};
+
+class TC_GAME_API BotDataMgrShutdownScript : public WorldScript
+{
+public:
+    BotDataMgrShutdownScript() : WorldScript("BotDataMgrShutdownScript") {}
+
+    void OnShutdown() override
+    {
+        botSpawnEvents.KillAllEvents(true);
+        for (auto& kv : botBGJoinEvents)
+            kv.second.KillAllEvents(true);
+    }
+};
+
+void AddSC_botdatamgr_scripts()
+{
+    new WanderingBotXpGainFormulaScript();
+    new BotDataMgrShutdownScript();
 }
 
 #ifdef _MSC_VER

@@ -1,6 +1,7 @@
 #include "bot_ai.h"
 #include "botspell.h"
 #include "bpet_ai.h"
+#include "Containers.h"
 #include "MotionMaster.h"
 #include "ScriptMgr.h"
 #include "SpellAuras.h"
@@ -91,7 +92,7 @@ public:
                 me->ToTempSummon()->UnSummon(1);
                 return;
             }
-            else if (!me->IsOutdoors() && (indoorsTimer += diff) >= TORNADO_DISSIPATE_TIMER)
+            else if ((IsIndoors() && !me->IsOutdoors()) && (isIndoorsTimer += diff) >= TORNADO_DISSIPATE_TIMER)
             {
                 canUpdate = false;
                 me->SetObjectScale(me->GetNativeObjectScale() / 2.f);
@@ -221,7 +222,7 @@ public:
             liveTimer = 0;
             moveResetTimer = 0;
             growthTimer = 0;
-            indoorsTimer = 0;
+            isIndoorsTimer = 0;
         }
 
         void InitPetSpells() override
@@ -240,7 +241,7 @@ public:
         uint32 liveTimer;
         uint32 moveResetTimer;
         uint32 growthTimer;
-        uint32 indoorsTimer;
+        uint32 isIndoorsTimer;
     };
 };
 

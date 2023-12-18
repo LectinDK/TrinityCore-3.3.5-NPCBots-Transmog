@@ -1,6 +1,8 @@
 #ifndef _BOT_PET_AI_H
 #define _BOT_PET_AI_H
 
+#include "botcommon.h"
+
 #include "CreatureAI.h"
 #include "Position.h"
 
@@ -25,13 +27,14 @@ class bot_pet_ai : public CreatureAI
         void Reset() override {}
 
         void JustDied(Unit*) override;
-        //virtual void KilledUnit(Unit* u);
+        void KilledUnit(Unit* u) override;
         void AttackStart(Unit* u) override;
         //virtual void JustEnteredCombat(Unit* u) override;
         void MoveInLineOfSight(Unit* /*u*/) override {}
         void DamageDealt(Unit* victim, uint32& damage, DamageEffectType damageType) override;
         void DamageTaken(Unit* /*attacker*/, uint32& /*damage*/, DamageEffectType /*damageType*/, SpellInfo const* /*spellInfo*/) override { }
         //void ReceiveEmote(Player* player, uint32 emote);
+        void EnterEvadeMode(EvadeReason/* why*/ = EVADE_REASON_OTHER) override { }
         uint32 GetData(uint32 data) const override;
         void IsSummonedBy(WorldObject* summoner) override;
 
@@ -41,9 +44,9 @@ class bot_pet_ai : public CreatureAI
         uint32 GetLastDiff() const { return lastdiff; }
         void CommonTimers(uint32 diff);
         void KillEvents(bool force);
-        void SetBotCommandState(uint8 st, bool force = false, Position* newpos = nullptr);
-        void RemoveBotCommandState(uint8 st);
-        bool HasBotCommandState(uint8 st) const { return (m_botCommandState & st); }
+        void SetBotCommandState(uint32 st, bool force = false, Position* newpos = nullptr);
+        void RemoveBotCommandState(uint32 st);
+        bool HasBotCommandState(uint32 st) const { return (m_botCommandState & st); }
         uint8 GetBotCommandState() const { return m_botCommandState; }
         bool IsInBotParty(Unit const* unit) const;
         virtual void ApplyBotPetSpellRadiusMods(SpellInfo const* /*spellInfo*/, float& /*radius*/) const {}
@@ -55,6 +58,10 @@ class bot_pet_ai : public CreatureAI
         //wandering bots
         bool IsWanderer() const { return _wanderer; }
         void SetWanderer() { if (IAmFree()) _wanderer = true; }
+
+        uint64 GetAuraUpdateMaskForRaid() const { return _auraRaidUpdateMask; }
+        void SetAuraUpdateMaskForRaid(uint8 slot) { _auraRaidUpdateMask |= (uint64(1) << slot); }
+        void ResetAuraUpdateMaskForRaid() { _auraRaidUpdateMask = 0; }
 
         static bool CCed(Unit const* target, bool root = false);
 
@@ -111,6 +118,8 @@ class bot_pet_ai : public CreatureAI
         bool JumpingFlyingOrFalling() const;
         bool JumpingOrFalling() const;
         bool Jumping() const;
+        bool IsIndoors() const;
+        bool IsOutdoors() const;
 
         float CalcSpellMaxRange(uint32 spellId, bool enemy = true) const;
         void CalculateAttackPos(Unit* target, Position &pos) const;
@@ -152,14 +161,19 @@ class bot_pet_ai : public CreatureAI
         static inline float _getAttackDistance(float distance) { return distance*0.72f; }
 
         Position movepos, attackpos;
-        uint8 m_botCommandState;
+        uint32 m_botCommandState;
 
         //timers
         uint32 lastdiff, checkAurasTimer, regenTimer, _updateTimerMedium, _updateTimerEx1;
-        mutable uint32 waitTimer;
+        uint32 waitTimer;
+        uint32 _moveBehindTimer;
+        uint32 indoorsTimer;
+        uint32 outdoorsTimer;
 
         //wandering bots
         bool _wanderer;
+
+        uint64 _auraRaidUpdateMask;
 
         float _energyFraction;
 

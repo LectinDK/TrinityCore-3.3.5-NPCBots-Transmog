@@ -31,6 +31,7 @@
 // npcbot
 class bot_ai;
 class bot_pet_ai;
+class Battleground;
 //end npcbot
 
 class CreatureAI;
@@ -380,7 +381,7 @@ class TC_GAME_API Creature : public Unit, public GridObject<Creature>, public Ma
         void ExitVehicle(Position const* exitPosition = nullptr) override;
 
         //NPCBots
-        bool LoadBotCreatureFromDB(ObjectGuid::LowType guid, Map* map, bool addToMap = true, bool generated = false, uint32 entry = 0, Position* pos = nullptr);
+        bool LoadBotCreatureFromDB(ObjectGuid::LowType guid, Map* map, bool addToMap = true, bool generated = false, uint32 entry = 0, Position const* pos = nullptr);
         Player* GetBotOwner() const;
         Unit* GetBotsPet() const;
         bool IsNPCBot() const override;
@@ -388,6 +389,17 @@ class TC_GAME_API Creature : public Unit, public GridObject<Creature>, public Ma
         bool IsNPCBotOrPet() const override;
         bool IsFreeBot() const;
         bool IsWandererBot() const;
+        Group* GetBotGroup() const;
+        void SetBotGroup(Group* group, int8 subgroup = -1);
+        uint8 GetSubGroup() const;
+        void SetSubGroup(uint8 subgroup);
+        void SetBattlegroundOrBattlefieldRaid(Group* group, int8 subgroup = -1);
+        void RemoveFromBattlegroundOrBattlefieldRaid();
+        Group* GetOriginalGroup() const;
+        void SetOriginalGroup(Group* group, int8 subgroup = -1);
+        uint8 GetOriginalSubGroup() const;
+        void SetOriginalSubGroup(uint8 subgroup);
+        Battleground* GetBotBG() const;
         uint8 GetBotClass() const;
         uint32 GetBotRoles() const;
         bot_ai* GetBotAI() const { return bot_AI; }

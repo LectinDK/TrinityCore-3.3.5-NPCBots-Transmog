@@ -3935,6 +3935,7 @@ Appender.Console=1,3,0
 Appender.Server=2,2,0,Server.log,w
 Appender.GM=2,2,1,GM.log
 Appender.DBErrors=2,2,0,DBErrors.log
+Appender.NpcBots=1,2,0
 
 #  Logger config values: Given a logger "name"
 #    Logger.name
@@ -3961,6 +3962,7 @@ Logger.scripts.hotswap=3,Console Server
 Logger.sql.sql=5,Console DBErrors
 Logger.sql.updates=3,Console Server
 Logger.mmaps=3,Server
+Logger.npcbots=2,NpcBots Server
 
 #Logger.achievement=3,Console Server
 #Logger.addon=3,Console Server
@@ -4193,13 +4195,16 @@ NpcBot.Botgiver.FilterRaces = 0
 NpcBot.BaseFollowDistance = 30
 
 #
-#    NpcBot.XpReduction
-#        Description: XP percent penalty for each bot used starting with second.
-#        Example:     3 bots, xp reduction is 20: ((3-1)*20) = 40%, 60% exp gained only.
+#    NpcBot.XpReduction.Amount
+#    NpcBot.XpReduction.StartingNumber
+#        Description: XP percent penalty for each bot used starting with <StartingNumber>.
+#        Example:     3 bots, reduction is 20, start is 2: ((3-(2-1))*20) = 40%, 60% exp gained.
 #        Note:        Maximum overall xp reduction is 90%.
-#        Default:     0
+#        Default:     0 - (NpcBot.XpReduction.Amount)
+#                     2 - (NpcBot.XpReduction.StartingNumber)
 
-NpcBot.XpReduction = 0
+NpcBot.XpReduction.Amount         = 0
+NpcBot.XpReduction.StartingNumber = 2
 
 #
 #    NpcBot.HealTargetIconMask
@@ -4239,6 +4244,7 @@ NpcBot.NoDPSTargetIconMask = 0
 #    NpcBot.Mult.Healing
 #    NpcBot.Mult.HP
 #        Description: Multipliers for bots' damage, healing, etc. Allows to balance bots vs players.
+#                     Only affects normal spawned bots and generated wandering bot in BGs.
 #        Default:     1.0
 #        Minimum:     0.1
 #        Maximum:    10.0
@@ -4247,6 +4253,22 @@ NpcBot.Mult.Damage.Physical = 1.0
 NpcBot.Mult.Damage.Spell    = 1.0
 NpcBot.Mult.Healing         = 1.0
 NpcBot.Mult.HP              = 1.0
+
+#
+#    NpcBot.Mult.Wanderer.Damage
+#    NpcBot.Mult.Wanderer.Healing
+#    NpcBot.Mult.Wanderer.HP
+#    NpcBot.Mult.Wanderer.Speed
+#        Description: Multipliers for wandering bots' damage, healing, hp and speed.
+#                     Only affects wandering bots in open world.
+#        Default:     1.0
+#        Minimum:     0.1
+#        Maximum:    10.0
+
+NpcBot.Mult.Wanderer.Damage  = 1.0
+NpcBot.Mult.Wanderer.Healing = 1.0
+NpcBot.Mult.Wanderer.HP      = 1.0
+NpcBot.Mult.Wanderer.Speed   = 1.0
 
 #
 #    NpcBot.Mult.Damage.<Class>
@@ -4273,6 +4295,17 @@ NpcBot.Mult.Damage.SpellBreaker      = 1.0
 NpcBot.Mult.Damage.DarkRanger        = 1.0
 NpcBot.Mult.Damage.Necromancer       = 1.0
 NpcBot.Mult.Damage.SeaWitch          = 1.0
+NpcBot.Mult.Damage.CryptLord         = 1.0
+
+#
+#    NpcBot.Mult.Damage.Levels
+#        Description: Multipliers for bots' damage by level: 0-9, 10-19, 20,29, ... , 70-79, 80+.
+#                     At least 9 values required.
+#        Default:     1.0
+#        Minimum:     0.1
+#        Maximum:    10.0
+
+NpcBot.Mult.Damage.Levels = 1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0
 
 #
 #    NpcBot.Enable.Dungeon
@@ -4415,26 +4448,57 @@ NpcBot.Transmog.UseEquipmentSlots = 0
 NpcBot.Gossip.ShowEquipmentListItems = 0
 
 #
-#    NpcBot.NewClasses.<Class>.Enable
-#        Description: Allow players to hire bots of non-standard classes.
-#        Note:        Some bot abilities may be unbalanced or game breaking.
-#        Default:     1 - (NpcBot.NewClasses.Blademaster.Enable)
-#                     1 - (NpcBot.NewClasses.ObsidianDestroyer.Enable)
-#                     1 - (NpcBot.NewClasses.Archmage.Enable)
-#                     1 - (NpcBot.NewClasses.Dreadlord.Enable)
-#                     1 - (NpcBot.NewClasses.SpellBreaker.Enable)
-#                     1 - (NpcBot.NewClasses.DarkRanger.Enable)
-#                     1 - (NpcBot.NewClasses.Necromancer.Enable)
-#                     1 - (NpcBot.NewClasses.SeaWitch.Enable)
+#    NpcBot.GearBank.Enable
+#        Description: Enable unlimited extra gear storage (accessible through gossip menu).
+#        Note: Unlimited storage creates an 'unlimited bags' exploit, you have been warned.
+#        Default:     0 - (Disabled)
+#                     1 - (Enabled)
 
-NpcBot.NewClasses.Blademaster.Enable       = 1
-NpcBot.NewClasses.ObsidianDestroyer.Enable = 1
-NpcBot.NewClasses.Archmage.Enable          = 1
-NpcBot.NewClasses.Dreadlord.Enable         = 1
-NpcBot.NewClasses.SpellBreaker.Enable      = 1
-NpcBot.NewClasses.DarkRanger.Enable        = 1
-NpcBot.NewClasses.Necromancer.Enable       = 1
-NpcBot.NewClasses.SeaWitch.Enable          = 1
+NpcBot.GearBank.Enable = 0
+
+#
+#    NpcBot.Classes.<Class>.Enable
+#        Description: Allow players to hire bots of certain classes.
+#        Note:        Some non-standard class abilities may be unbalanced or game breaking.
+#        Default:     1 - (NpcBot.Classes.Warrior.Enable)
+#                     1 - (NpcBot.Classes.Paladin.Enable)
+#                     1 - (NpcBot.Classes.Hunter.Enable)
+#                     1 - (NpcBot.Classes.Rogue.Enable)
+#                     1 - (NpcBot.Classes.Priest.Enable)
+#                     1 - (NpcBot.Classes.DeathKnight.Enable)
+#                     1 - (NpcBot.Classes.Shaman.Enable)
+#                     1 - (NpcBot.Classes.Mage.Enable)
+#                     1 - (NpcBot.Classes.Warlock.Enable)
+#                     1 - (NpcBot.Classes.Druid.Enable)
+#                     0 - (NpcBot.Classes.Blademaster.Enable)
+#                     1 - (NpcBot.Classes.ObsidianDestroyer.Enable)
+#                     1 - (NpcBot.Classes.Archmage.Enable)
+#                     1 - (NpcBot.Classes.Dreadlord.Enable)
+#                     1 - (NpcBot.Classes.SpellBreaker.Enable)
+#                     1 - (NpcBot.Classes.DarkRanger.Enable)
+#                     1 - (NpcBot.Classes.Necromancer.Enable)
+#                     1 - (NpcBot.Classes.SeaWitch.Enable)
+#                     1 - (NpcBot.Classes.CryptLord.Enable)
+
+NpcBot.Classes.Warrior.Enable           = 1
+NpcBot.Classes.Paladin.Enable           = 1
+NpcBot.Classes.Hunter.Enable            = 1
+NpcBot.Classes.Rogue.Enable             = 1
+NpcBot.Classes.Priest.Enable            = 1
+NpcBot.Classes.DeathKnight.Enable       = 1
+NpcBot.Classes.Shaman.Enable            = 1
+NpcBot.Classes.Mage.Enable              = 1
+NpcBot.Classes.Warlock.Enable           = 1
+NpcBot.Classes.Druid.Enable             = 1
+NpcBot.Classes.Blademaster.Enable       = 0
+NpcBot.Classes.ObsidianDestroyer.Enable = 1
+NpcBot.Classes.Archmage.Enable          = 1
+NpcBot.Classes.Dreadlord.Enable         = 1
+NpcBot.Classes.SpellBreaker.Enable      = 1
+NpcBot.Classes.DarkRanger.Enable        = 1
+NpcBot.Classes.Necromancer.Enable       = 1
+NpcBot.Classes.SeaWitch.Enable          = 1
+NpcBot.Classes.CryptLord.Enable         = 1
 
 #
 #    NpcBot.Stats.Limits.Enable
@@ -4488,15 +4552,102 @@ NpcBot.OwnershipExpireTime = 0
 NpcBot.EnrageOnDismiss = 1
 
 #
-#    NpcBot.DesiredWanderingBotsCount
-#        Description: Number of free wandering bots to generate. Wandering bots, well, wander
+#    NpcBot.WanderingBots.Continents.Count
+#        Description: Desired number of free wandering bots to generate. Wandering bots roam
 #                     around the map looking for trouble. Names and visuals are cloned from
 #                     existing non-spawned bots. Wandering bots aren't saved in DB.
 #        Note:        Wandering bots keep grids loaded, increasing CPU and memory usage.
 #        Note2:       You must have at least this number of non-spawned bots in creature_template.
-#        Default:     0  - (Disabled)
+#        Default:     0 - (Disabled)
 
-NpcBot.DesiredWanderingBotsCount = 0
+NpcBot.WanderingBots.Continents.Count = 0
+
+#
+#    NpcBot.WanderingBots.Continents.Levels
+#        Description: Percentage of wandering bots to spawn per level bracket:
+#                     0-9, 10-19, 20,29, ... , 70-79, 80+.
+#        Note:        Total percentage must be exactly 100.
+#        Note2:       Classes with minimum level requirement may ignore this parameter.
+#        Default:     25,15,15,10,5,10,20,0,0
+
+NpcBot.WanderingBots.Continents.Levels = 25,15,15,10,5,10,20,0,0
+
+#
+#    NpcBot.WanderingBots.Continents.Maps
+#        Description: Continent map IDs where wandering bots are allowed to spawn.
+#        Note:        Wandering bots will never outlevel the map they are in.
+#        Default:     0,1,530,571 - (Eastern Kingdoms, Kalimdor, Outland, Northrend)
+
+NpcBot.WanderingBots.Continents.Maps = 0,1,530,571
+
+#
+#    NpcBot.WanderingBots.BG.Enable
+#        Description: Allow wandering bots generation for Battlegrounds.
+#        Note:        Bots are temporarily borrowed from non-spawned bots pool.
+#        Default:     0 - (Disabled)
+#                     1 - (Enable)
+
+NpcBot.WanderingBots.BG.Enable = 0
+
+#
+#    NpcBot.WanderingBots.BG.CapLevel
+#        Description: Enforce BG bot maximum level limit set by Expansion and MaxPlayerLevel
+#                     config paramter values.
+#        Default:     0 - (Disabled)
+#                     1 - (Enable)
+
+NpcBot.WanderingBots.BG.CapLevel = 0
+
+#
+#    NpcBot.WanderingBots.BG.TargetTeamPlayersCount.<BGTYPE>
+#        Description: Target BG players count per team to aim for when generating BG bots.
+#        Note:        These values can't go beyond BG minimum / maximum players per team bounds.
+#        Default:     30 - (NpcBot.WanderingBots.BG.TargetTeamPlayersCount.AV)
+#                     8  - (NpcBot.WanderingBots.BG.TargetTeamPlayersCount.WS)
+#                     12 - (NpcBot.WanderingBots.BG.TargetTeamPlayersCount.AB)
+#                     0  - (NpcBot.WanderingBots.BG.TargetTeamPlayersCount.EY) (NYI, Disabled)
+#                     0  - (NpcBot.WanderingBots.BG.TargetTeamPlayersCount.SA) (NYI, Disabled)
+#                     0  - (NpcBot.WanderingBots.BG.TargetTeamPlayersCount.IC) (NYI, Disabled)
+
+NpcBot.WanderingBots.BG.TargetTeamPlayersCount.AV = 30
+NpcBot.WanderingBots.BG.TargetTeamPlayersCount.WS = 8
+NpcBot.WanderingBots.BG.TargetTeamPlayersCount.AB = 12
+NpcBot.WanderingBots.BG.TargetTeamPlayersCount.EY = 0
+NpcBot.WanderingBots.BG.TargetTeamPlayersCount.SA = 0
+NpcBot.WanderingBots.BG.TargetTeamPlayersCount.IC = 0
+
+#
+#    NpcBot.HK.Enable
+#        Description: Count NPCBot kill at honor kill.
+#        Default:     1 - (Enabled)
+#                     0 - (Disabled)
+
+NpcBot.HK.Enable = 1
+
+#
+#    NpcBot.HK.Message.Enable
+#        Description: Show 'HK: <rank>' message for NPCBot honor kills.
+#        Default:     0 - (Disabled)
+#                     1 - (Enabled)
+
+NpcBot.HK.Message.Enable = 0
+
+#
+#    NpcBot.HK.Achievements.Enable
+#        Description: Count NPCBot honor kills towards PvP achievements.
+#        Default:     0 - (Disabled)
+#                     1 - (Enabled)
+
+NpcBot.HK.Achievements.Enable = 0
+
+#
+#    NpcBot.HK.Rate.Honor
+#        Description: Honor gained multiplier for NPCBot honor kills.
+#        Default:     1.0
+#        Minimum:     0.1
+#        Maximum:    10.0
+
+NpcBot.HK.Rate.Honor = 1.0
 
 #
 ###################################################################################################
